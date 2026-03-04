@@ -1,0 +1,1906 @@
+{
+  "total_unique_words": 287948,
+  "words_with_entity_signal": 29862,
+  "vocabulary_coverage": 10.37062247350216,
+  "per_type_top10": {
+    "Laterality": [
+      {
+        "word": "supracapsular",
+        "probability": 1.0
+      },
+      {
+        "word": "interpolar",
+        "probability": 1.0
+      },
+      {
+        "word": "medial-sided",
+        "probability": 1.0
+      },
+      {
+        "word": "bilaterlally",
+        "probability": 1.0
+      },
+      {
+        "word": "midthoracic",
+        "probability": 1.0
+      },
+      {
+        "word": "inferolaterally",
+        "probability": 1.0
+      },
+      {
+        "word": "apico-anterior",
+        "probability": 1.0
+      },
+      {
+        "word": "medial-posterior-superior",
+        "probability": 1.0
+      },
+      {
+        "word": "subfasciall",
+        "probability": 1.0
+      },
+      {
+        "word": "transfascia",
+        "probability": 1.0
+      }
+    ],
+    "Release_Med": [
+      {
+        "word": "e.c.",
+        "probability": 1.0
+      },
+      {
+        "word": "e.r.",
+        "probability": 1.0
+      },
+      {
+        "word": "enteric-coasted",
+        "probability": 1.0
+      },
+      {
+        "word": "gelcap",
+        "probability": 1.0
+      },
+      {
+        "word": "streng",
+        "probability": 1.0
+      },
+      {
+        "word": "biphase",
+        "probability": 1.0
+      },
+      {
+        "word": "releas",
+        "probability": 1.0
+      },
+      {
+        "word": "e.c",
+        "probability": 1.0
+      },
+      {
+        "word": "ext.release",
+        "probability": 1.0
+      },
+      {
+        "word": ",delayed",
+        "probability": 1.0
+      }
+    ],
+    "Contrast": [
+      {
+        "word": "choletec",
+        "probability": 1.0
+      },
+      {
+        "word": "w/w/o",
+        "probability": 1.0
+      },
+      {
+        "word": "gadolinium,",
+        "probability": 1.0
+      },
+      {
+        "word": "visipaque320",
+        "probability": 1.0
+      },
+      {
+        "word": "intr",
+        "probability": 1.0
+      },
+      {
+        "word": "avenous",
+        "probability": 1.0
+      },
+      {
+        "word": "213.70",
+        "probability": 1.0
+      },
+      {
+        "word": "1986.70",
+        "probability": 1.0
+      },
+      {
+        "word": "1692.6",
+        "probability": 1.0
+      },
+      {
+        "word": "magnevist",
+        "probability": 1.0
+      }
+    ],
+    "Route_Med": [
+      {
+        "word": "rect",
+        "probability": 1.0
+      },
+      {
+        "word": "idrm",
+        "probability": 1.0
+      },
+      {
+        "word": "subl",
+        "probability": 1.0
+      },
+      {
+        "word": "ear(s)",
+        "probability": 1.0
+      },
+      {
+        "word": "translaminar",
+        "probability": 1.0
+      },
+      {
+        "word": "jtube",
+        "probability": 1.0
+      },
+      {
+        "word": "opht",
+        "probability": 1.0
+      },
+      {
+        "word": "nasally",
+        "probability": 1.0
+      },
+      {
+        "word": "submucosally",
+        "probability": 1.0
+      },
+      {
+        "word": "eye-right",
+        "probability": 1.0
+      }
+    ],
+    "Substance_Abuse": [
+      {
+        "word": "abus",
+        "probability": 1.0
+      },
+      {
+        "word": "deuces",
+        "probability": 1.0
+      },
+      {
+        "word": "ivdu",
+        "probability": 1.0
+      },
+      {
+        "word": "drinkin",
+        "probability": 1.0
+      },
+      {
+        "word": "cocktails",
+        "probability": 1.0
+      },
+      {
+        "word": "substance;usage",
+        "probability": 1.0
+      },
+      {
+        "word": "oi",
+        "probability": 1.0
+      },
+      {
+        "word": "nosmoking",
+        "probability": 1.0
+      },
+      {
+        "word": "tobac",
+        "probability": 1.0
+      },
+      {
+        "word": "aod",
+        "probability": 1.0
+      }
+    ],
+    "Drug": [
+      {
+        "word": "vibramycin",
+        "probability": 1.0
+      },
+      {
+        "word": "arginaid",
+        "probability": 1.0
+      },
+      {
+        "word": "ranitican",
+        "probability": 1.0
+      },
+      {
+        "word": "risamine",
+        "probability": 1.0
+      },
+      {
+        "word": "cisatracurium",
+        "probability": 1.0
+      },
+      {
+        "word": "dexmedetomidine",
+        "probability": 1.0
+      },
+      {
+        "word": "roflumilast",
+        "probability": 1.0
+      },
+      {
+        "word": "tuberculin",
+        "probability": 1.0
+      },
+      {
+        "word": "alteplase",
+        "probability": 1.0
+      },
+      {
+        "word": "cathflo",
+        "probability": 1.0
+      }
+    ],
+    "Totaldose_Med": [
+      {
+        "word": "#54",
+        "probability": 1.0
+      },
+      {
+        "word": "4000ml",
+        "probability": 1.0
+      },
+      {
+        "word": "#600",
+        "probability": 1.0
+      },
+      {
+        "word": "34units",
+        "probability": 1.0
+      },
+      {
+        "word": "#80",
+        "probability": 1.0
+      },
+      {
+        "word": "87ml",
+        "probability": 1.0
+      },
+      {
+        "word": "#62",
+        "probability": 1.0
+      },
+      {
+        "word": "#6.7",
+        "probability": 1.0
+      },
+      {
+        "word": "#2.5",
+        "probability": 1.0
+      },
+      {
+        "word": "#255",
+        "probability": 1.0
+      }
+    ],
+    "Maneuver": [
+      {
+        "word": "dive",
+        "probability": 1.0
+      },
+      {
+        "word": "post-exercise",
+        "probability": 1.0
+      },
+      {
+        "word": "laterals",
+        "probability": 0.5
+      },
+      {
+        "word": "excercise",
+        "probability": 0.4
+      },
+      {
+        "word": "cck",
+        "probability": 0.25
+      },
+      {
+        "word": "post-stress",
+        "probability": 0.1875
+      },
+      {
+        "word": "kinevac",
+        "probability": 0.16666666666666666
+      },
+      {
+        "word": "stress",
+        "probability": 0.1542830099384761
+      },
+      {
+        "word": "frog",
+        "probability": 0.0963855421686747
+      },
+      {
+        "word": "retroflexion",
+        "probability": 0.08823529411764706
+      }
+    ],
+    "Tnm": [
+      {
+        "word": "t2n0",
+        "probability": 1.0
+      },
+      {
+        "word": "pt1an1a",
+        "probability": 1.0
+      },
+      {
+        "word": "ct1cnxmx",
+        "probability": 1.0
+      },
+      {
+        "word": "n1b",
+        "probability": 1.0
+      },
+      {
+        "word": "t4n0m1",
+        "probability": 1.0
+      },
+      {
+        "word": "t1b,",
+        "probability": 1.0
+      },
+      {
+        "word": "mt1a",
+        "probability": 1.0
+      },
+      {
+        "word": "pt2a2,",
+        "probability": 1.0
+      },
+      {
+        "word": "t4b",
+        "probability": 1.0
+      },
+      {
+        "word": "t3n0m0",
+        "probability": 1.0
+      }
+    ],
+    "Modality": [
+      {
+        "word": "2+view",
+        "probability": 1.0
+      },
+      {
+        "word": "2+views",
+        "probability": 1.0
+      },
+      {
+        "word": "multi-weighed",
+        "probability": 1.0
+      },
+      {
+        "word": "expir",
+        "probability": 1.0
+      },
+      {
+        "word": "3mem",
+        "probability": 1.0
+      },
+      {
+        "word": "2-3v",
+        "probability": 1.0
+      },
+      {
+        "word": "frogleg",
+        "probability": 1.0
+      },
+      {
+        "word": "4v",
+        "probability": 1.0
+      },
+      {
+        "word": "spair",
+        "probability": 1.0
+      },
+      {
+        "word": "shaded-surface-display",
+        "probability": 1.0
+      }
+    ],
+    "Result_Lab": [
+      {
+        "word": "normochrom",
+        "probability": 1.0
+      },
+      {
+        "word": "non-immune",
+        "probability": 1.0
+      },
+      {
+        "word": "vma",
+        "probability": 1.0
+      },
+      {
+        "word": "positiveh",
+        "probability": 1.0
+      },
+      {
+        "word": "occa",
+        "probability": 1.0
+      },
+      {
+        "word": "manya",
+        "probability": 1.0
+      },
+      {
+        "word": "eleavted",
+        "probability": 1.0
+      },
+      {
+        "word": "diptheroid",
+        "probability": 1.0
+      },
+      {
+        "word": "bacillius",
+        "probability": 1.0
+      },
+      {
+        "word": "brevundimonas",
+        "probability": 1.0
+      }
+    ],
+    "Dose_Med": [
+      {
+        "word": "2sprays",
+        "probability": 1.0
+      },
+      {
+        "word": "1tablet",
+        "probability": 1.0
+      },
+      {
+        "word": "hi-dose",
+        "probability": 1.0
+      },
+      {
+        "word": "1app",
+        "probability": 1.0
+      },
+      {
+        "word": "x3doses",
+        "probability": 1.0
+      },
+      {
+        "word": "4drops",
+        "probability": 1.0
+      },
+      {
+        "word": "1pad",
+        "probability": 1.0
+      },
+      {
+        "word": "247.5",
+        "probability": 1.0
+      },
+      {
+        "word": "dose-reduced",
+        "probability": 1.0
+      },
+      {
+        "word": "halved",
+        "probability": 1.0
+      }
+    ],
+    "Value_BM": [
+      {
+        "word": "6lb11oz",
+        "probability": 1.0
+      },
+      {
+        "word": "116/68",
+        "probability": 1.0
+      },
+      {
+        "word": "135/65",
+        "probability": 1.0
+      },
+      {
+        "word": "101/65",
+        "probability": 1.0
+      },
+      {
+        "word": "100/70",
+        "probability": 1.0
+      },
+      {
+        "word": "2.818",
+        "probability": 1.0
+      },
+      {
+        "word": "104/58",
+        "probability": 1.0
+      },
+      {
+        "word": "88/40",
+        "probability": 1.0
+      },
+      {
+        "word": "60/30",
+        "probability": 1.0
+      },
+      {
+        "word": "145/82",
+        "probability": 1.0
+      }
+    ],
+    "Value_BF": [
+      {
+        "word": "60deg",
+        "probability": 1.0
+      },
+      {
+        "word": "25-degree",
+        "probability": 1.0
+      },
+      {
+        "word": "105deg",
+        "probability": 1.0
+      },
+      {
+        "word": "0-90",
+        "probability": 1.0
+      },
+      {
+        "word": "65deg",
+        "probability": 1.0
+      },
+      {
+        "word": "50deg",
+        "probability": 1.0
+      },
+      {
+        "word": "50lbs",
+        "probability": 1.0
+      },
+      {
+        "word": "110deg",
+        "probability": 1.0
+      },
+      {
+        "word": "100deg",
+        "probability": 1.0
+      },
+      {
+        "word": "40deg",
+        "probability": 1.0
+      }
+    ],
+    "Unit_BM": [
+      {
+        "word": "degf",
+        "probability": 1.0
+      },
+      {
+        "word": "breaths/min",
+        "probability": 1.0
+      },
+      {
+        "word": "mmhg/s",
+        "probability": 1.0
+      },
+      {
+        "word": "6degc",
+        "probability": 1.0
+      },
+      {
+        "word": "ml/55",
+        "probability": 1.0
+      },
+      {
+        "word": "(lbs/oz)",
+        "probability": 1.0
+      },
+      {
+        "word": "lbs/oz",
+        "probability": 1.0
+      },
+      {
+        "word": "ft/in",
+        "probability": 1.0
+      },
+      {
+        "word": "/51",
+        "probability": 1.0
+      },
+      {
+        "word": "ml/84",
+        "probability": 1.0
+      }
+    ],
+    "Body_Measurement": [
+      {
+        "word": "expirium",
+        "probability": 1.0
+      },
+      {
+        "word": "o2sat",
+        "probability": 1.0
+      },
+      {
+        "word": "oxy",
+        "probability": 1.0
+      },
+      {
+        "word": "p1/2t",
+        "probability": 1.0
+      },
+      {
+        "word": "e-wave",
+        "probability": 1.0
+      },
+      {
+        "word": "a-wave",
+        "probability": 1.0
+      },
+      {
+        "word": "stats",
+        "probability": 1.0
+      },
+      {
+        "word": "pulseox",
+        "probability": 1.0
+      },
+      {
+        "word": "temperatue",
+        "probability": 1.0
+      },
+      {
+        "word": "bood",
+        "probability": 1.0
+      }
+    ],
+    "Compliance_Status": [
+      {
+        "word": "non-adherence",
+        "probability": 0.8
+      },
+      {
+        "word": "non-compliance",
+        "probability": 0.6666666666666666
+      },
+      {
+        "word": "non-compliant",
+        "probability": 0.52
+      },
+      {
+        "word": "tolerant.",
+        "probability": 0.5
+      },
+      {
+        "word": "noncompliance",
+        "probability": 0.42786069651741293
+      },
+      {
+        "word": "noncompliant",
+        "probability": 0.4228187919463087
+      },
+      {
+        "word": "tolerability",
+        "probability": 0.4
+      },
+      {
+        "word": "compliant",
+        "probability": 0.3821478382147838
+      },
+      {
+        "word": "nonadherence",
+        "probability": 0.36538461538461536
+      },
+      {
+        "word": "complying",
+        "probability": 0.3333333333333333
+      }
+    ],
+    "Medical_Condition": [
+      {
+        "word": "vasodepressor",
+        "probability": 1.0
+      },
+      {
+        "word": "strok",
+        "probability": 1.0
+      },
+      {
+        "word": "hydronephros",
+        "probability": 1.0
+      },
+      {
+        "word": "uretero",
+        "probability": 1.0
+      },
+      {
+        "word": "hypercholesteremia",
+        "probability": 1.0
+      },
+      {
+        "word": "pafib",
+        "probability": 1.0
+      },
+      {
+        "word": "diseass",
+        "probability": 1.0
+      },
+      {
+        "word": "hypoadrenalism",
+        "probability": 1.0
+      },
+      {
+        "word": "tornwaldt",
+        "probability": 1.0
+      },
+      {
+        "word": "ankyloglossia",
+        "probability": 1.0
+      }
+    ],
+    "Anatomical_Structure": [
+      {
+        "word": "extemities",
+        "probability": 1.0
+      },
+      {
+        "word": "philthrum",
+        "probability": 1.0
+      },
+      {
+        "word": "interspinal",
+        "probability": 1.0
+      },
+      {
+        "word": "l1-5",
+        "probability": 1.0
+      },
+      {
+        "word": "thyrohyoid",
+        "probability": 1.0
+      },
+      {
+        "word": "earlobes",
+        "probability": 1.0
+      },
+      {
+        "word": "calcanium",
+        "probability": 1.0
+      },
+      {
+        "word": "achillles",
+        "probability": 1.0
+      },
+      {
+        "word": "scm",
+        "probability": 1.0
+      },
+      {
+        "word": "transcervical",
+        "probability": 1.0
+      }
+    ],
+    "Unit_Lab": [
+      {
+        "word": "ug/dl",
+        "probability": 1.0
+      },
+      {
+        "word": "e.u./dl",
+        "probability": 1.0
+      },
+      {
+        "word": "bac/hpf",
+        "probability": 1.0
+      },
+      {
+        "word": "/mcl",
+        "probability": 1.0
+      },
+      {
+        "word": "mciu/ml",
+        "probability": 1.0
+      },
+      {
+        "word": "u/dl",
+        "probability": 1.0
+      },
+      {
+        "word": "mm/hr",
+        "probability": 1.0
+      },
+      {
+        "word": "lpf",
+        "probability": 1.0
+      },
+      {
+        "word": "miu/ml",
+        "probability": 1.0
+      },
+      {
+        "word": "umol/l",
+        "probability": 1.0
+      }
+    ],
+    "Medical_Device": [
+      {
+        "word": "e-polyethylene",
+        "probability": 1.0
+      },
+      {
+        "word": "3/4''",
+        "probability": 1.0
+      },
+      {
+        "word": "podus",
+        "probability": 1.0
+      },
+      {
+        "word": "mccabe",
+        "probability": 1.0
+      },
+      {
+        "word": "dissectors",
+        "probability": 1.0
+      },
+      {
+        "word": "promogran",
+        "probability": 1.0
+      },
+      {
+        "word": "hologic",
+        "probability": 1.0
+      },
+      {
+        "word": "mcculloch",
+        "probability": 1.0
+      },
+      {
+        "word": "gif",
+        "probability": 1.0
+      },
+      {
+        "word": "2628892",
+        "probability": 1.0
+      }
+    ],
+    "Result_BM": [
+      {
+        "word": "category1",
+        "probability": 1.0
+      },
+      {
+        "word": "adeuate",
+        "probability": 1.0
+      },
+      {
+        "word": "98th",
+        "probability": 1.0
+      },
+      {
+        "word": "reasonable/normal",
+        "probability": 1.0
+      },
+      {
+        "word": "<llow",
+        "probability": 1.0
+      },
+      {
+        "word": "nonsignificance",
+        "probability": 1.0
+      },
+      {
+        "word": "cno",
+        "probability": 1.0
+      },
+      {
+        "word": "near-normal",
+        "probability": 1.0
+      },
+      {
+        "word": "warm-to-warm",
+        "probability": 1.0
+      },
+      {
+        "word": "irreg.",
+        "probability": 1.0
+      }
+    ],
+    "Result_BF": [
+      {
+        "word": "disfluent",
+        "probability": 1.0
+      },
+      {
+        "word": "hypofunctional",
+        "probability": 1.0
+      },
+      {
+        "word": "n/t",
+        "probability": 1.0
+      },
+      {
+        "word": "unlabor",
+        "probability": 1.0
+      },
+      {
+        "word": "obeys-commands",
+        "probability": 1.0
+      },
+      {
+        "word": "dysarthritic",
+        "probability": 1.0
+      },
+      {
+        "word": "well-heard",
+        "probability": 1.0
+      },
+      {
+        "word": "normoproductive",
+        "probability": 1.0
+      },
+      {
+        "word": "nonfluent",
+        "probability": 1.0
+      },
+      {
+        "word": "nonpressured",
+        "probability": 1.0
+      }
+    ],
+    "Duration_Med": [
+      {
+        "word": "60days",
+        "probability": 1.0
+      },
+      {
+        "word": "90days",
+        "probability": 1.0
+      },
+      {
+        "word": "30days",
+        "probability": 1.0
+      },
+      {
+        "word": "5xd",
+        "probability": 1.0
+      },
+      {
+        "word": "six-day",
+        "probability": 1.0
+      },
+      {
+        "word": "xtwo",
+        "probability": 1.0
+      },
+      {
+        "word": "13-14",
+        "probability": 0.8333333333333334
+      },
+      {
+        "word": "x10-14",
+        "probability": 0.75
+      },
+      {
+        "word": "x7",
+        "probability": 0.5714285714285714
+      },
+      {
+        "word": "7days",
+        "probability": 0.5
+      }
+    ],
+    "Sign_Symptom": [
+      {
+        "word": "nonbacteremic",
+        "probability": 1.0
+      },
+      {
+        "word": "ccough",
+        "probability": 1.0
+      },
+      {
+        "word": "aandox3",
+        "probability": 1.0
+      },
+      {
+        "word": "headness",
+        "probability": 1.0
+      },
+      {
+        "word": "loopiness",
+        "probability": 1.0
+      },
+      {
+        "word": "bezoar",
+        "probability": 1.0
+      },
+      {
+        "word": "sorethroat",
+        "probability": 1.0
+      },
+      {
+        "word": "mumur",
+        "probability": 1.0
+      },
+      {
+        "word": "bodyaches",
+        "probability": 1.0
+      },
+      {
+        "word": "microspherocyte",
+        "probability": 1.0
+      }
+    ],
+    "Unit_Med": [
+      {
+        "word": "mg/hr",
+        "probability": 1.0
+      },
+      {
+        "word": "unttis",
+        "probability": 1.0
+      },
+      {
+        "word": "/ml",
+        "probability": 1.0
+      },
+      {
+        "word": "unit/gram",
+        "probability": 1.0
+      },
+      {
+        "word": "mg/patch",
+        "probability": 1.0
+      },
+      {
+        "word": "milliequivalent",
+        "probability": 1.0
+      },
+      {
+        "word": "kcal/ml",
+        "probability": 1.0
+      },
+      {
+        "word": "unit/g",
+        "probability": 1.0
+      },
+      {
+        "word": "units/minute",
+        "probability": 1.0
+      },
+      {
+        "word": "meq/hr",
+        "probability": 1.0
+      }
+    ],
+    "Form_Med": [
+      {
+        "word": "lozeng",
+        "probability": 1.0
+      },
+      {
+        "word": "pkt",
+        "probability": 1.0
+      },
+      {
+        "word": "icaps",
+        "probability": 1.0
+      },
+      {
+        "word": "respule",
+        "probability": 1.0
+      },
+      {
+        "word": "injects",
+        "probability": 1.0
+      },
+      {
+        "word": "emul",
+        "probability": 1.0
+      },
+      {
+        "word": "o.d.t.",
+        "probability": 1.0
+      },
+      {
+        "word": "sprayss",
+        "probability": 1.0
+      },
+      {
+        "word": "redihaler",
+        "probability": 1.0
+      },
+      {
+        "word": "2drops",
+        "probability": 1.0
+      }
+    ],
+    "Sample_Lab": [
+      {
+        "word": "ur",
+        "probability": 0.9465541490857946
+      },
+      {
+        "word": "urin",
+        "probability": 0.8461538461538461
+      },
+      {
+        "word": "urine",
+        "probability": 0.6992523364485981
+      },
+      {
+        "word": "u",
+        "probability": 0.6811926605504587
+      },
+      {
+        "word": "stoool",
+        "probability": 0.5
+      },
+      {
+        "word": "sputums",
+        "probability": 0.5
+      },
+      {
+        "word": "wound-tissue-drainage",
+        "probability": 0.3333333333333333
+      },
+      {
+        "word": "ven",
+        "probability": 0.32786885245901637
+      },
+      {
+        "word": "kpc",
+        "probability": 0.2857142857142857
+      },
+      {
+        "word": "bld",
+        "probability": 0.22857142857142856
+      }
+    ],
+    "Body_Function": [
+      {
+        "word": "biomechanics",
+        "probability": 1.0
+      },
+      {
+        "word": "motionno",
+        "probability": 1.0
+      },
+      {
+        "word": "rrom",
+        "probability": 1.0
+      },
+      {
+        "word": "fucntion",
+        "probability": 1.0
+      },
+      {
+        "word": "vestibulo-ocluar",
+        "probability": 1.0
+      },
+      {
+        "word": "peri-cares",
+        "probability": 1.0
+      },
+      {
+        "word": "bm's",
+        "probability": 1.0
+      },
+      {
+        "word": "vestibulo-ocular",
+        "probability": 1.0
+      },
+      {
+        "word": "abductions",
+        "probability": 1.0
+      },
+      {
+        "word": "smack",
+        "probability": 1.0
+      }
+    ],
+    "Therapeutic_Procedure": [
+      {
+        "word": "vaportrode",
+        "probability": 1.0
+      },
+      {
+        "word": "pleurocentesis",
+        "probability": 1.0
+      },
+      {
+        "word": "ileocecectomy",
+        "probability": 1.0
+      },
+      {
+        "word": "ex-lap",
+        "probability": 1.0
+      },
+      {
+        "word": "placemt",
+        "probability": 1.0
+      },
+      {
+        "word": "denuding",
+        "probability": 1.0
+      },
+      {
+        "word": "exfoliating",
+        "probability": 1.0
+      },
+      {
+        "word": "laminotomy",
+        "probability": 1.0
+      },
+      {
+        "word": "rmanagement",
+        "probability": 1.0
+      },
+      {
+        "word": "pcis",
+        "probability": 1.0
+      }
+    ],
+    "Molecular_Subtype": [
+      {
+        "word": "mlh-1",
+        "probability": 1.0
+      },
+      {
+        "word": "nki-67",
+        "probability": 1.0
+      },
+      {
+        "word": "dnm1l",
+        "probability": 1.0
+      },
+      {
+        "word": "mtdna",
+        "probability": 1.0
+      },
+      {
+        "word": "mt-nd5",
+        "probability": 1.0
+      },
+      {
+        "word": "fab",
+        "probability": 1.0
+      },
+      {
+        "word": "flt3",
+        "probability": 1.0
+      },
+      {
+        "word": "gener",
+        "probability": 1.0
+      },
+      {
+        "word": "fmc7",
+        "probability": 1.0
+      },
+      {
+        "word": "atm/11q22",
+        "probability": 1.0
+      }
+    ],
+    "Medical_State": [
+      {
+        "word": "0/7",
+        "probability": 1.0
+      },
+      {
+        "word": "g2p0@40.3",
+        "probability": 1.0
+      },
+      {
+        "word": "siup",
+        "probability": 1.0
+      },
+      {
+        "word": "2-0-1-2",
+        "probability": 1.0
+      },
+      {
+        "word": "g1nowp1",
+        "probability": 1.0
+      },
+      {
+        "word": "g2p0",
+        "probability": 1.0
+      },
+      {
+        "word": "g8p6",
+        "probability": 1.0
+      },
+      {
+        "word": "g3p1@40.3",
+        "probability": 1.0
+      },
+      {
+        "word": "g5p3@40.1",
+        "probability": 1.0
+      },
+      {
+        "word": "40.2wks",
+        "probability": 1.0
+      }
+    ],
+    "Severity": [
+      {
+        "word": "modestseverity",
+        "probability": 1.0
+      },
+      {
+        "word": "mild-mod",
+        "probability": 1.0
+      },
+      {
+        "word": "significnat",
+        "probability": 1.0
+      },
+      {
+        "word": "3b",
+        "probability": 1.0
+      },
+      {
+        "word": "sev",
+        "probability": 1.0
+      },
+      {
+        "word": "first-degrees",
+        "probability": 1.0
+      },
+      {
+        "word": "lessening",
+        "probability": 1.0
+      },
+      {
+        "word": "minimal-to-mild",
+        "probability": 1.0
+      },
+      {
+        "word": "total-body-involvement",
+        "probability": 1.0
+      },
+      {
+        "word": "t-ii",
+        "probability": 1.0
+      }
+    ],
+    "Value_Lab": [
+      {
+        "word": "110.6279",
+        "probability": 1.0
+      },
+      {
+        "word": "8.79",
+        "probability": 1.0
+      },
+      {
+        "word": "7.27",
+        "probability": 1.0
+      },
+      {
+        "word": "14.30",
+        "probability": 1.0
+      },
+      {
+        "word": "87.0",
+        "probability": 1.0
+      },
+      {
+        "word": "2.659",
+        "probability": 1.0
+      },
+      {
+        "word": "30.4150",
+        "probability": 1.0
+      },
+      {
+        "word": "7.43",
+        "probability": 1.0
+      },
+      {
+        "word": "3460",
+        "probability": 1.0
+      },
+      {
+        "word": "0.022",
+        "probability": 1.0
+      }
+    ],
+    "Method_Procedure": [
+      {
+        "word": "off-pump",
+        "probability": 1.0
+      },
+      {
+        "word": "transcath",
+        "probability": 1.0
+      },
+      {
+        "word": "arthroscopically-assisted",
+        "probability": 1.0
+      },
+      {
+        "word": "non-reverse",
+        "probability": 1.0
+      },
+      {
+        "word": "d-c",
+        "probability": 1.0
+      },
+      {
+        "word": "orringer",
+        "probability": 1.0
+      },
+      {
+        "word": "transcoronary",
+        "probability": 1.0
+      },
+      {
+        "word": "tendon-grasping",
+        "probability": 1.0
+      },
+      {
+        "word": "krakow",
+        "probability": 1.0
+      },
+      {
+        "word": "sab-block",
+        "probability": 1.0
+      }
+    ],
+    "Result_Procedure": [
+      {
+        "word": "degraded",
+        "probability": 1.0
+      },
+      {
+        "word": "97/96",
+        "probability": 1.0
+      },
+      {
+        "word": "ligamentously",
+        "probability": 1.0
+      },
+      {
+        "word": "at-3",
+        "probability": 1.0
+      },
+      {
+        "word": "10.1/2.7/99/0",
+        "probability": 1.0
+      },
+      {
+        "word": "4.7/2.1/113/0",
+        "probability": 1.0
+      },
+      {
+        "word": "fair-to-well",
+        "probability": 1.0
+      },
+      {
+        "word": "secondsr",
+        "probability": 1.0
+      },
+      {
+        "word": "false-positive",
+        "probability": 1.0
+      },
+      {
+        "word": "wnl's",
+        "probability": 1.0
+      }
+    ],
+    "Laboratory_Data": [
+      {
+        "word": "fungitell",
+        "probability": 1.0
+      },
+      {
+        "word": "corr",
+        "probability": 1.0
+      },
+      {
+        "word": "estimat",
+        "probability": 1.0
+      },
+      {
+        "word": "alanine",
+        "probability": 1.0
+      },
+      {
+        "word": "aminotransferase",
+        "probability": 1.0
+      },
+      {
+        "word": "ast/sgot",
+        "probability": 1.0
+      },
+      {
+        "word": "alt/sgpt",
+        "probability": 1.0
+      },
+      {
+        "word": "troponin-i",
+        "probability": 1.0
+      },
+      {
+        "word": "vldl-",
+        "probability": 1.0
+      },
+      {
+        "word": "trig",
+        "probability": 1.0
+      }
+    ],
+    "Strength_Med": [
+      {
+        "word": "115ml/hr",
+        "probability": 1.0
+      },
+      {
+        "word": ">250mg",
+        "probability": 1.0
+      },
+      {
+        "word": "10-325",
+        "probability": 1.0
+      },
+      {
+        "word": "0.2mg",
+        "probability": 1.0
+      },
+      {
+        "word": "500/125",
+        "probability": 1.0
+      },
+      {
+        "word": "1700mg",
+        "probability": 1.0
+      },
+      {
+        "word": "4/200",
+        "probability": 1.0
+      },
+      {
+        "word": "7.500129",
+        "probability": 1.0
+      },
+      {
+        "word": "10mg/ml",
+        "probability": 1.0
+      },
+      {
+        "word": "999.9",
+        "probability": 1.0
+      }
+    ],
+    "Frequency_Med": [
+      {
+        "word": "6-8hr",
+        "probability": 1.0
+      },
+      {
+        "word": "tiems",
+        "probability": 1.0
+      },
+      {
+        "word": "minu.",
+        "probability": 1.0
+      },
+      {
+        "word": "bidneb",
+        "probability": 1.0
+      },
+      {
+        "word": "q4-6h",
+        "probability": 1.0
+      },
+      {
+        "word": "dailys",
+        "probability": 1.0
+      },
+      {
+        "word": "6x/day",
+        "probability": 1.0
+      },
+      {
+        "word": "30bidac",
+        "probability": 1.0
+      },
+      {
+        "word": "q.h.s",
+        "probability": 1.0
+      },
+      {
+        "word": "dailyl",
+        "probability": 1.0
+      }
+    ],
+    "Method_Lab": [
+      {
+        "word": "rt-pcr",
+        "probability": 1.0
+      },
+      {
+        "word": "aut",
+        "probability": 1.0
+      },
+      {
+        "word": "pran",
+        "probability": 1.0
+      },
+      {
+        "word": "solid-phase",
+        "probability": 1.0
+      },
+      {
+        "word": "immunoassay",
+        "probability": 1.0
+      },
+      {
+        "word": "diff;",
+        "probability": 1.0
+      },
+      {
+        "word": "auto",
+        "probability": 0.9860208980513979
+      },
+      {
+        "word": "quant",
+        "probability": 0.8571428571428571
+      },
+      {
+        "word": "dipstick",
+        "probability": 0.818407960199005
+      },
+      {
+        "word": "pcr",
+        "probability": 0.7027649769585254
+      }
+    ],
+    "Diagnostic_Procedure": [
+      {
+        "word": "mamo",
+        "probability": 1.0
+      },
+      {
+        "word": "ctscans",
+        "probability": 1.0
+      },
+      {
+        "word": "ctscan",
+        "probability": 1.0
+      },
+      {
+        "word": "headct",
+        "probability": 1.0
+      },
+      {
+        "word": "ascultation",
+        "probability": 1.0
+      },
+      {
+        "word": "captometry",
+        "probability": 1.0
+      },
+      {
+        "word": "ventriculography",
+        "probability": 1.0
+      },
+      {
+        "word": "exami",
+        "probability": 1.0
+      },
+      {
+        "word": "cholangiography",
+        "probability": 1.0
+      },
+      {
+        "word": "sonograms",
+        "probability": 1.0
+      }
+    ],
+    "Drug_Combo": [
+      {
+        "word": "umeclidinium-vilanterol",
+        "probability": 1.0
+      },
+      {
+        "word": ";multivitamin,tx-iron-ca-fa-min",
+        "probability": 1.0
+      },
+      {
+        "word": "carb-cholecalciferol",
+        "probability": 1.0
+      },
+      {
+        "word": "multivitamins-iron",
+        "probability": 1.0
+      },
+      {
+        "word": "chlorpheniramine-pseudoephedrine",
+        "probability": 1.0
+      },
+      {
+        "word": "diphenhydramine/hc/nystatin",
+        "probability": 1.0
+      },
+      {
+        "word": "phos,m-b/na",
+        "probability": 1.0
+      },
+      {
+        "word": "phos,di-ba",
+        "probability": 1.0
+      },
+      {
+        "word": "oxycodone/",
+        "probability": 1.0
+      },
+      {
+        "word": "hcl-timolol",
+        "probability": 1.0
+      }
+    ],
+    "Generic": [
+      {
+        "word": "gray-red-to-tan",
+        "probability": 1.0
+      },
+      {
+        "word": "non-necrotic",
+        "probability": 1.0
+      },
+      {
+        "word": "scaterred",
+        "probability": 1.0
+      },
+      {
+        "word": "black-gray-to-tan-pink",
+        "probability": 1.0
+      },
+      {
+        "word": "gray-black-to-tan-pink",
+        "probability": 1.0
+      },
+      {
+        "word": "black-pink-to-tan",
+        "probability": 1.0
+      },
+      {
+        "word": "productiv",
+        "probability": 1.0
+      },
+      {
+        "word": "nonsentinel",
+        "probability": 1.0
+      },
+      {
+        "word": "intractability",
+        "probability": 1.0
+      },
+      {
+        "word": "short-term-acting",
+        "probability": 1.0
+      }
+    ],
+    "Status_Med": [
+      {
+        "word": "discontnuing",
+        "probability": 1.0
+      },
+      {
+        "word": "hold-off",
+        "probability": 1.0
+      },
+      {
+        "word": "cutback",
+        "probability": 1.0
+      },
+      {
+        "word": "withheld",
+        "probability": 0.8
+      },
+      {
+        "word": "dced",
+        "probability": 0.8
+      },
+      {
+        "word": "discontinuance",
+        "probability": 0.75
+      },
+      {
+        "word": "reinitiate",
+        "probability": 0.7272727272727273
+      },
+      {
+        "word": "dc",
+        "probability": 0.6100056850483229
+      },
+      {
+        "word": "discontinued",
+        "probability": 0.525096525096525
+      },
+      {
+        "word": "restarted",
+        "probability": 0.5
+      }
+    ]
+  },
+  "total_samples_processed": 80433,
+  "phase1_ner_samples": 36463,
+  "phase2_ner_samples": 43970,
+  "distribution_dim": 45,
+  "default_unknown_distribution": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    1.0
+  ]
+}
