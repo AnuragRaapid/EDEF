@@ -67,7 +67,7 @@ def parse_args():
     parser.add_argument(
         "--phase1_model",
         type=str,
-        default="saves/phase1_merged",
+        default="/workspace/Soft Prompt Tuning/qwen3-phase1-checkpoint",
         help="Path to Phase 1 merged model.",
     )
     parser.add_argument(
@@ -79,25 +79,25 @@ def parse_args():
     parser.add_argument(
         "--base_model",
         type=str,
-        default="Qwen/Qwen3-4B-Instruct",
+        default="unsloth/Qwen3-4B-Instruct-2507",
         help="Base model ID when using --phase1_adapter.",
     )
     parser.add_argument(
         "--train_data",
         type=str,
-        default="/home/anurag/NER/Multi-task Finetuning/Multitask Finetuning Phase 2 Dataset/train_ner_filtered.json",
+        default="/workspace/Soft Prompt Tuning/data/train_ner_filtered.json",
         help="Phase 2 NER train JSON path.",
     )
     parser.add_argument(
         "--val_data",
         type=str,
-        default="/home/anurag/NER/Multi-task Finetuning/Multitask Finetuning Phase 2 Dataset/val_ner_filtered.json",
+        default="/workspace/Soft Prompt Tuning/data/val_ner_filtered.json",
         help="Phase 2 NER validation JSON path.",
     )
     parser.add_argument(
         "--dist_path",
         type=str,
-        default="/home/anurag/NER/Soft Prompt Tuning/entity_distributions.json",
+        default="/workspace/Soft Prompt Tuning/entity_distributions.json",
         help="Entity distribution file path.",
     )
     parser.add_argument("--output_dir", type=str, default="saves/edef-stage1")
@@ -127,7 +127,7 @@ def load_phase1_model(args):
         model: Any = AutoModelForCausalLM.from_pretrained(
             args.base_model,
             torch_dtype=torch.bfloat16,
-            device_map="auto",
+            device_map={"": "cuda:0"},
         )
         model = PeftModel.from_pretrained(model, args.phase1_adapter)
         model = model.merge_and_unload()
@@ -135,7 +135,7 @@ def load_phase1_model(args):
         model = AutoModelForCausalLM.from_pretrained(
             args.phase1_model,
             torch_dtype=torch.bfloat16,
-            device_map="auto",
+            device_map={"": "cuda:0"},
         )
     return model
 
@@ -209,7 +209,9 @@ def main():
         warmup_ratio=args.warmup_ratio,
         bf16=args.bf16,
         fp16=not args.bf16,
-        optim="adamw_torch",
+        tf32=True,
+        optim="adamw_torch_fused",
+        torch_compile=True,
         logging_steps=args.logging_steps,
         save_strategy="steps",
         save_steps=args.save_steps,
@@ -218,6 +220,8 @@ def main():
         remove_unused_columns=False,
         seed=args.seed,
         dataloader_pin_memory=True,
+        dataloader_num_workers=4,
+        dataloader_prefetch_factor=2,
         report_to="none",
     )
 
