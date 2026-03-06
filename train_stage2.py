@@ -31,7 +31,9 @@ load_edef_checkpoint = _model_mod.load_edef_checkpoint
 save_edef_checkpoint = _model_mod.save_edef_checkpoint
 
 if __package__:
-    _dataset_utils_mod = importlib.import_module(".ner_dataset_utils", package=__package__)
+    _dataset_utils_mod = importlib.import_module(
+        ".ner_dataset_utils", package=__package__
+    )
 else:
     _dataset_utils_mod = importlib.import_module("ner_dataset_utils")
 
@@ -81,6 +83,27 @@ def get_model_with_edef(model):
     return None
 
 
+def patch_transformers_tf32() -> None:
+    if not hasattr(torch.backends, "fp32_precision"):
+        return
+
+    cuda_backend = getattr(torch.backends, "cuda", None)
+    matmul_backend = getattr(cuda_backend, "matmul", None)
+    if matmul_backend is None or not hasattr(matmul_backend, "allow_tf32"):
+        return
+
+    import transformers.training_args as hf_training_args
+
+    # TorchInductor still reads the legacy TF32 getter during torch.compile().
+    def _legacy_enable_tf32(enable: bool) -> None:
+        matmul_backend.allow_tf32 = enable
+        cudnn_backend = getattr(torch.backends, "cudnn", None)
+        if cudnn_backend is not None and hasattr(cudnn_backend, "allow_tf32"):
+            cudnn_backend.allow_tf32 = enable
+
+    hf_training_args.enable_tf32 = _legacy_enable_tf32
+
+
 class GateLoggingCallback(TrainerCallback):
     def __init__(self, model: Any, log_every_steps: int = 100):
         self.model = model
@@ -112,7 +135,9 @@ class GateLoggingCallback(TrainerCallback):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Stage 2 EDEF training (LoRA + projector + gate).")
+    parser = argparse.ArgumentParser(
+        description="Stage 2 EDEF training (LoRA + projector + gate)."
+    )
     parser.add_argument(
         "--phase1_model",
         type=str,
@@ -161,9 +186,9 @@ def parse_args():
     parser.add_argument("--cache_dir", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default="saves/edef-stage2")
     parser.add_argument("--max_length", type=int, default=4096)
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--grad_accum", type=int, default=8)
-    parser.add_argument("--epochs", type=float, default=2)
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--grad_accum", type=int, default=4)
+    parser.add_argument("--epochs", type=float, default=4)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--warmup_ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=3407)
@@ -202,6 +227,7 @@ def load_phase1_model(args):
 def main():
     args = parse_args()
     torch.manual_seed(args.seed)
+    patch_transformers_tf32()
     task_metadata = load_task_metadata_from_dist_path(args.dist_path)
     dist_dim = int(task_metadata["dist_dim"])
     instruction = str(task_metadata["instruction"])
@@ -259,7 +285,9 @@ def main():
         setattr(config, "use_cache", False)
 
     model.print_trainable_parameters()
-    print(f"Loaded {len(task_metadata['entity_types'])} entity types: {task_metadata['entity_types']}")
+    print(
+        f"Loaded {len(task_metadata['entity_types'])} entity types: {task_metadata['entity_types']}"
+    )
 
     print("Building EDEF datasets...")
     train_dataset = build_edef_dataset(
@@ -321,7 +349,9 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=data_collator,
-        callbacks=[GateLoggingCallback(model=model, log_every_steps=args.gate_log_steps)],
+        callbacks=[
+            GateLoggingCallback(model=model, log_every_steps=args.gate_log_steps)
+        ],
     )
 
     print("Starting Stage 2 EDEF training...")
@@ -332,8 +362,12 @@ def main():
 
     base_with_edef = get_model_with_edef(model)
     if base_with_edef is None:
-        raise RuntimeError("Could not find model carrying EDEF modules for checkpoint save.")
-    save_edef_checkpoint(base_with_edef, os.path.join(args.output_dir, "edef_checkpoint"))
+        raise RuntimeError(
+            "Could not find model carrying EDEF modules for checkpoint save."
+        )
+    save_edef_checkpoint(
+        base_with_edef, os.path.join(args.output_dir, "edef_checkpoint")
+    )
 
     print("Stage 2 training complete!")
     print(f"LoRA + EDEF saved to {args.output_dir}")

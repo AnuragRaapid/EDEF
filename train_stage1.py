@@ -30,7 +30,9 @@ from ner_dataset_utils import (
 
 
 class EDEFTrainer(Trainer):
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+    def compute_loss(
+        self, model, inputs, return_outputs=False, num_items_in_batch=None
+    ):
         entity_dist_vectors = inputs.pop("entity_dist_vectors", None)
         if entity_dist_vectors is not None:
             inputs["entity_dist_vectors"] = entity_dist_vectors
@@ -69,7 +71,9 @@ class GateLoggingCallback(TrainerCallback):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Stage 1 EDEF training (projector + gate only).")
+    parser = argparse.ArgumentParser(
+        description="Stage 1 EDEF training (projector + gate only)."
+    )
     parser.add_argument(
         "--phase1_model",
         type=str,
@@ -112,11 +116,11 @@ def parse_args():
     parser.add_argument("--cache_dir", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default="saves/edef-stage1")
     parser.add_argument("--max_length", type=int, default=4096)
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--grad_accum", type=int, default=8)
-    parser.add_argument("--epochs", type=float, default=3)
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--grad_accum", type=int, default=4)
+    parser.add_argument("--epochs", type=float, default=5)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--warmup_ratio", type=float, default=0.1)
+    parser.add_argument("--warmup_ratio", type=float, default=0.03)
     parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--logging_steps", type=int, default=10)
@@ -158,9 +162,31 @@ def print_trainable_params(model):
     print(f"Trainable params: {trainable:,} ({pct:.2f}%)")
 
 
+def patch_transformers_tf32() -> None:
+    if not hasattr(torch.backends, "fp32_precision"):
+        return
+
+    cuda_backend = getattr(torch.backends, "cuda", None)
+    matmul_backend = getattr(cuda_backend, "matmul", None)
+    if matmul_backend is None or not hasattr(matmul_backend, "allow_tf32"):
+        return
+
+    import transformers.training_args as hf_training_args
+
+    # TorchInductor still reads the legacy TF32 getter during torch.compile().
+    def _legacy_enable_tf32(enable: bool) -> None:
+        matmul_backend.allow_tf32 = enable
+        cudnn_backend = getattr(torch.backends, "cudnn", None)
+        if cudnn_backend is not None and hasattr(cudnn_backend, "allow_tf32"):
+            cudnn_backend.allow_tf32 = enable
+
+    hf_training_args.enable_tf32 = _legacy_enable_tf32
+
+
 def main():
     args = parse_args()
     torch.manual_seed(args.seed)
+    patch_transformers_tf32()
     task_metadata = load_task_metadata_from_dist_path(args.dist_path)
     dist_dim = int(task_metadata["dist_dim"])
     instruction = str(task_metadata["instruction"])
@@ -191,7 +217,9 @@ def main():
             model.config.use_cache = False
 
     print_trainable_params(model)
-    print(f"Loaded {len(task_metadata['entity_types'])} entity types: {task_metadata['entity_types']}")
+    print(
+        f"Loaded {len(task_metadata['entity_types'])} entity types: {task_metadata['entity_types']}"
+    )
 
     print("Building EDEF datasets...")
     train_dataset = build_edef_dataset(
@@ -253,7 +281,9 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=data_collator,
-        callbacks=[GateLoggingCallback(model=model, log_every_steps=args.gate_log_steps)],
+        callbacks=[
+            GateLoggingCallback(model=model, log_every_steps=args.gate_log_steps)
+        ],
     )
 
     print("Starting Stage 1 EDEF training...")
