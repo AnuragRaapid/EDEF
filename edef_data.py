@@ -16,6 +16,13 @@ else:
 get_token_distributions = _dist_mod.get_token_distributions
 load_distributions = _dist_mod.load_distributions
 
+if __package__:
+    _dataset_utils_mod = importlib.import_module(".ner_dataset_utils", package=__package__)
+else:
+    _dataset_utils_mod = importlib.import_module("ner_dataset_utils")
+
+load_ner_samples = _dataset_utils_mod.load_ner_samples
+
 
 class EDEFDataset(Dataset[dict[str, torch.Tensor]]):
     def __init__(
@@ -25,7 +32,7 @@ class EDEFDataset(Dataset[dict[str, torch.Tensor]]):
         word_entity_dist: dict[str, list[float]],
         default_dist: list[float],
         max_length: int = 4096,
-        dist_dim: int = 45,
+        dist_dim: int | None = None,
         chat_template_fn: Callable[[dict[str, Any]], str] | None = None,
     ) -> None:
         self.samples = samples
@@ -33,7 +40,7 @@ class EDEFDataset(Dataset[dict[str, torch.Tensor]]):
         self.word_entity_dist = word_entity_dist
         self.default_dist = default_dist
         self.max_length = max_length
-        self.dist_dim = dist_dim
+        self.dist_dim = dist_dim if dist_dim is not None else len(default_dist)
         self.chat_template_fn = chat_template_fn
 
     def __len__(self) -> int:
@@ -200,13 +207,26 @@ def build_edef_dataset(
     tokenizer: Any,
     dist_path: str,
     max_length: int = 4096,
-    dist_dim: int = 45,
+    dist_dim: int | None = None,
     chat_template_fn: Callable[[dict[str, Any]], str] | None = None,
+    dataset_split: str | None = None,
+    dataset_revision: str | None = None,
+    cache_dir: str | None = None,
+    instruction: str | None = None,
 ) -> EDEFDataset:
-    with open(data_path, "r", encoding="utf-8") as f:
-        samples = json.load(f)
-
+    samples = load_ner_samples(
+        data_path,
+        split=dataset_split,
+        dataset_revision=dataset_revision,
+        cache_dir=cache_dir,
+        instruction=instruction,
+    )
     word_entity_dist, default_dist = load_distributions(dist_path)
+    effective_dist_dim = len(default_dist) if dist_dim is None else dist_dim
+    if effective_dist_dim != len(default_dist):
+        raise ValueError(
+            f"dist_dim={effective_dist_dim} does not match distribution file dimension={len(default_dist)}"
+        )
 
     return EDEFDataset(
         samples=samples,
@@ -214,7 +234,7 @@ def build_edef_dataset(
         word_entity_dist=word_entity_dist,
         default_dist=default_dist,
         max_length=max_length,
-        dist_dim=dist_dim,
+        dist_dim=effective_dist_dim,
         chat_template_fn=chat_template_fn,
     )
 

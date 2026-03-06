@@ -15,11 +15,14 @@ import time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-
-NER_INSTRUCTION = (
-    "You are an expert medical Named Entity Recognition (NER) assistant. "
-    "Your task is to extract and classify entities from the provided medical text. "
-    "Output format should be {'ner': [['entity', 'type'], ['entity', 'type'],...]}"
+from ner_dataset_utils import (
+    DEFAULT_DATASET_NAME,
+    DEFAULT_DIST_PATH,
+    DEFAULT_PHASE1_MODEL_PATH,
+    build_ner_instruction,
+    extract_entity_types_from_samples,
+    load_ner_samples,
+    load_task_metadata_from_dist_path,
 )
 
 
@@ -215,9 +218,9 @@ def load_model_and_tokenizer(model_path: str, adapter_path: str | None, base_mod
     return model, tokenizer
 
 
-def build_prompt(tokenizer, text: str) -> str:
+def build_prompt(tokenizer, instruction: str, text: str) -> str:
     messages = [
-        {"role": "system", "content": NER_INSTRUCTION},
+        {"role": "system", "content": instruction},
         {"role": "user", "content": text},
     ]
     return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -251,8 +254,14 @@ def extract_ner_json_string(generated_text: str) -> str:
     return text
 
 
-def generate_prediction(model, tokenizer, text: str, max_new_tokens: int) -> tuple[str, float]:
-    prompt = build_prompt(tokenizer, text)
+def generate_prediction(
+    model,
+    tokenizer,
+    instruction: str,
+    text: str,
+    max_new_tokens: int,
+) -> tuple[str, float]:
+    prompt = build_prompt(tokenizer, instruction, text)
     encoded = tokenizer(prompt, return_tensors="pt")
 
     target_device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -277,13 +286,23 @@ def generate_prediction(model, tokenizer, text: str, max_new_tokens: int) -> tup
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Baseline NER re-evaluation")
-    parser.add_argument("--model_path", type=str, default="saves/phase1_merged")
+    parser.add_argument("--model_path", type=str, default=DEFAULT_PHASE1_MODEL_PATH)
     parser.add_argument("--adapter_path", type=str, default=None)
     parser.add_argument("--base_model", type=str, default="Qwen/Qwen3-4B-Instruct")
     parser.add_argument(
         "--test_data",
         type=str,
-        default="/home/anurag/NER/Multi-task Finetuning/Multitask Finetuning Phase 2 Dataset/test_ner_filtered.json",
+        default=DEFAULT_DATASET_NAME,
+        help="Local JSON path or Hugging Face dataset repo id for test data.",
+    )
+    parser.add_argument("--test_split", type=str, default="test")
+    parser.add_argument("--dataset_revision", type=str, default=None)
+    parser.add_argument("--cache_dir", type=str, default=None)
+    parser.add_argument(
+        "--dist_path",
+        type=str,
+        default=DEFAULT_DIST_PATH,
+        help="Optional distribution path used to load the exact label prompt.",
     )
     parser.add_argument("--output_dir", type=str, default="evaluation_results")
     parser.add_argument("--max_new_tokens", type=int, default=2048)
@@ -293,12 +312,20 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-
-    with open(args.test_data, "r", encoding="utf-8") as f:
-        test_samples = json.load(f)
+    test_samples = load_ner_samples(
+        args.test_data,
+        split=args.test_split,
+        dataset_revision=args.dataset_revision,
+        cache_dir=args.cache_dir,
+    )
 
     if args.max_samples is not None:
         test_samples = test_samples[: args.max_samples]
+
+    if os.path.exists(args.dist_path):
+        instruction = load_task_metadata_from_dist_path(args.dist_path)["instruction"]
+    else:
+        instruction = build_ner_instruction(extract_entity_types_from_samples(test_samples))
 
     model, tokenizer = load_model_and_tokenizer(
         model_path=args.model_path,
@@ -318,6 +345,7 @@ def main() -> None:
         generated_text, elapsed = generate_prediction(
             model=model,
             tokenizer=tokenizer,
+            instruction=instruction,
             text=input_text,
             max_new_tokens=args.max_new_tokens,
         )
@@ -373,6 +401,7 @@ def main() -> None:
         "adapter_path": args.adapter_path,
         "base_model": args.base_model,
         "test_data": args.test_data,
+        "test_split": args.test_split,
         "num_samples": len(test_samples),
         "exact_match": {
             "precision": exact_precision,

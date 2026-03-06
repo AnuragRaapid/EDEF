@@ -30,6 +30,16 @@ attach_edef_to_model = _model_mod.attach_edef_to_model
 load_edef_checkpoint = _model_mod.load_edef_checkpoint
 save_edef_checkpoint = _model_mod.save_edef_checkpoint
 
+if __package__:
+    _dataset_utils_mod = importlib.import_module(".ner_dataset_utils", package=__package__)
+else:
+    _dataset_utils_mod = importlib.import_module("ner_dataset_utils")
+
+DEFAULT_DATASET_NAME = _dataset_utils_mod.DEFAULT_DATASET_NAME
+DEFAULT_DIST_PATH = _dataset_utils_mod.DEFAULT_DIST_PATH
+DEFAULT_PHASE1_MODEL_PATH = _dataset_utils_mod.DEFAULT_PHASE1_MODEL_PATH
+load_task_metadata_from_dist_path = _dataset_utils_mod.load_task_metadata_from_dist_path
+
 
 class EDEFTrainer(Trainer):
     def compute_loss(
@@ -106,7 +116,7 @@ def parse_args():
     parser.add_argument(
         "--phase1_model",
         type=str,
-        default="/workspace/Soft Prompt Tuning/qwen3-phase1-checkpoint",
+        default=DEFAULT_PHASE1_MODEL_PATH,
         help="Path to Phase 1 model (merged weights).",
     )
     parser.add_argument(
@@ -130,18 +140,25 @@ def parse_args():
     parser.add_argument(
         "--train_data",
         type=str,
-        default="/workspace/Soft Prompt Tuning/data/train_ner_filtered.json",
+        default=DEFAULT_DATASET_NAME,
+        help="Local JSON path or Hugging Face dataset repo id for training data.",
     )
     parser.add_argument(
         "--val_data",
         type=str,
-        default="/workspace/Soft Prompt Tuning/data/val_ner_filtered.json",
+        default=DEFAULT_DATASET_NAME,
+        help="Local JSON path or Hugging Face dataset repo id for validation data.",
     )
     parser.add_argument(
         "--dist_path",
         type=str,
-        default="/workspace/Soft Prompt Tuning/entity_distributions.json",
+        default=DEFAULT_DIST_PATH,
+        help="Entity distribution file path.",
     )
+    parser.add_argument("--train_split", type=str, default="train")
+    parser.add_argument("--val_split", type=str, default="validation")
+    parser.add_argument("--dataset_revision", type=str, default=None)
+    parser.add_argument("--cache_dir", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default="saves/edef-stage2")
     parser.add_argument("--max_length", type=int, default=4096)
     parser.add_argument("--batch_size", type=int, default=4)
@@ -185,6 +202,9 @@ def load_phase1_model(args):
 def main():
     args = parse_args()
     torch.manual_seed(args.seed)
+    task_metadata = load_task_metadata_from_dist_path(args.dist_path)
+    dist_dim = int(task_metadata["dist_dim"])
+    instruction = str(task_metadata["instruction"])
 
     tokenizer_source = args.base_model if args.phase1_adapter else args.phase1_model
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, trust_remote_code=True)
@@ -196,7 +216,7 @@ def main():
     model = load_phase1_model(args)
 
     hidden_dim = getattr(model.config, "hidden_size", 2560)
-    model = attach_edef_to_model(model, dist_dim=45, hidden_dim=hidden_dim)
+    model = attach_edef_to_model(model, dist_dim=dist_dim, hidden_dim=hidden_dim)
 
     if not args.skip_stage1 and os.path.exists(args.stage1_checkpoint):
         load_edef_checkpoint(model, args.stage1_checkpoint)
@@ -239,6 +259,7 @@ def main():
         setattr(config, "use_cache", False)
 
     model.print_trainable_parameters()
+    print(f"Loaded {len(task_metadata['entity_types'])} entity types: {task_metadata['entity_types']}")
 
     print("Building EDEF datasets...")
     train_dataset = build_edef_dataset(
@@ -246,14 +267,22 @@ def main():
         tokenizer=tokenizer,
         dist_path=args.dist_path,
         max_length=args.max_length,
-        dist_dim=45,
+        dist_dim=dist_dim,
+        dataset_split=args.train_split,
+        dataset_revision=args.dataset_revision,
+        cache_dir=args.cache_dir,
+        instruction=instruction,
     )
     eval_dataset = build_edef_dataset(
         data_path=args.val_data,
         tokenizer=tokenizer,
         dist_path=args.dist_path,
         max_length=args.max_length,
-        dist_dim=45,
+        dist_dim=dist_dim,
+        dataset_split=args.val_split,
+        dataset_revision=args.dataset_revision,
+        cache_dir=args.cache_dir,
+        instruction=instruction,
     )
     data_collator = EDEFDataCollator(tokenizer=tokenizer, max_length=args.max_length)
 

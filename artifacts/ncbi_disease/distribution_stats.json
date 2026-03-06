@@ -1,0 +1,207 @@
+{
+  "data_source": "anurag-raapid/ncbi-disease",
+  "count_split": "train",
+  "label_splits": [
+    "train",
+    "validation",
+    "test"
+  ],
+  "entity_types": [
+    "CompositeMention",
+    "DiseaseClass",
+    "Modifier",
+    "SpecificDisease"
+  ],
+  "entity_type_counts": {
+    "Modifier": 1767,
+    "SpecificDisease": 3939,
+    "CompositeMention": 170,
+    "DiseaseClass": 1016
+  },
+  "distribution_dim": 5,
+  "o_index": 4,
+  "prompt_instruction": "You are an expert biomedical Named Entity Recognition (NER) assistant. Extract every entity mention from the provided biomedical text and classify each mention using exactly one of the following entity types: CompositeMention, DiseaseClass, Modifier, SpecificDisease. Use the exact surface form from the input text, do not normalize or paraphrase entities, and return only valid JSON in the exact format {\"ner\": [[\"entity text\", \"EntityType\"], ...]}. If there are no entities, return {\"ner\": []}.",
+  "default_unknown_distribution": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    1.0
+  ],
+  "total_unique_words": 8423,
+  "words_with_entity_signal": 984,
+  "vocabulary_coverage": 11.682298468479164,
+  "samples_processed": 593,
+  "tokenized_samples": 593,
+  "fallback_samples": 0,
+  "per_type_top10": {
+    "CompositeMention": [
+      {
+        "word": "vasculopathy",
+        "probability": 1.0
+      },
+      {
+        "word": "nonsyndromic",
+        "probability": 1.0
+      },
+      {
+        "word": "fibroepithelial",
+        "probability": 1.0
+      },
+      {
+        "word": "hyperplasias",
+        "probability": 1.0
+      },
+      {
+        "word": "sinuses",
+        "probability": 1.0
+      },
+      {
+        "word": "neuro",
+        "probability": 1.0
+      },
+      {
+        "word": "logical",
+        "probability": 1.0
+      },
+      {
+        "word": "intraretinal",
+        "probability": 1.0
+      },
+      {
+        "word": "gait",
+        "probability": 1.0
+      },
+      {
+        "word": "centric",
+        "probability": 1.0
+      }
+    ],
+    "DiseaseClass": [
+      {
+        "word": "neurodegeneration",
+        "probability": 1.0
+      },
+      {
+        "word": "convulsive",
+        "probability": 1.0
+      },
+      {
+        "word": "inborn",
+        "probability": 1.0
+      },
+      {
+        "word": "insufficiency",
+        "probability": 1.0
+      },
+      {
+        "word": "deterioration",
+        "probability": 1.0
+      },
+      {
+        "word": "adenoma",
+        "probability": 1.0
+      },
+      {
+        "word": "glycosphingolipid",
+        "probability": 1.0
+      },
+      {
+        "word": "delays",
+        "probability": 1.0
+      },
+      {
+        "word": "myelinopathies",
+        "probability": 1.0
+      },
+      {
+        "word": "pns",
+        "probability": 1.0
+      }
+    ],
+    "Modifier": [
+      {
+        "word": "neoplastic",
+        "probability": 1.0
+      },
+      {
+        "word": "nonneoplastic",
+        "probability": 1.0
+      },
+      {
+        "word": "hemochromatotic",
+        "probability": 1.0
+      },
+      {
+        "word": "nonpapillary",
+        "probability": 1.0
+      },
+      {
+        "word": "hyperphenylalaninemic",
+        "probability": 1.0
+      },
+      {
+        "word": "obese",
+        "probability": 1.0
+      },
+      {
+        "word": "leukemic",
+        "probability": 1.0
+      },
+      {
+        "word": "anxiety",
+        "probability": 1.0
+      },
+      {
+        "word": "piebald",
+        "probability": 1.0
+      },
+      {
+        "word": "hepatoma",
+        "probability": 1.0
+      }
+    ],
+    "SpecificDisease": [
+      {
+        "word": "premenopausal",
+        "probability": 1.0
+      },
+      {
+        "word": "alzheimer",
+        "probability": 1.0
+      },
+      {
+        "word": "gonococcal",
+        "probability": 1.0
+      },
+      {
+        "word": "meningitis",
+        "probability": 1.0
+      },
+      {
+        "word": "chh",
+        "probability": 1.0
+      },
+      {
+        "word": "hodgkins",
+        "probability": 1.0
+      },
+      {
+        "word": "dihydropyrimidine",
+        "probability": 1.0
+      },
+      {
+        "word": "denys",
+        "probability": 1.0
+      },
+      {
+        "word": "drash",
+        "probability": 1.0
+      },
+      {
+        "word": "mesothelioma",
+        "probability": 1.0
+      }
+    ]
+  }
+}

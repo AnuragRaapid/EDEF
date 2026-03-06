@@ -25,21 +25,21 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 if __package__:
     _dist_mod = importlib.import_module(".distribution_alignment", package=__package__)
     _edef_mod = importlib.import_module(".edef_model", package=__package__)
+    _dataset_utils_mod = importlib.import_module(".ner_dataset_utils", package=__package__)
 else:
     _dist_mod = importlib.import_module("distribution_alignment")
     _edef_mod = importlib.import_module("edef_model")
+    _dataset_utils_mod = importlib.import_module("ner_dataset_utils")
 
 get_token_distributions = _dist_mod.get_token_distributions
 load_distributions = _dist_mod.load_distributions
 attach_edef_to_model = _edef_mod.attach_edef_to_model
 load_edef_checkpoint = _edef_mod.load_edef_checkpoint
-
-
-NER_INSTRUCTION = (
-    "You are an expert medical Named Entity Recognition (NER) assistant. "
-    "Your task is to extract and classify entities from the provided medical text. "
-    "Output format should be {'ner': [['entity', 'type'], ['entity', 'type'],...]}"
-)
+DEFAULT_DATASET_NAME = _dataset_utils_mod.DEFAULT_DATASET_NAME
+DEFAULT_DIST_PATH = _dataset_utils_mod.DEFAULT_DIST_PATH
+DEFAULT_PHASE1_MODEL_PATH = _dataset_utils_mod.DEFAULT_PHASE1_MODEL_PATH
+load_ner_samples = _dataset_utils_mod.load_ner_samples
+load_task_metadata_from_dist_path = _dataset_utils_mod.load_task_metadata_from_dist_path
 
 
 def _strip_think_tags(text: str) -> str:
@@ -149,7 +149,14 @@ def _resolve_edef_modules(model: Any) -> tuple[torch.nn.Module, torch.nn.Module]
     return projector, gate
 
 
-def load_edef_model(args: argparse.Namespace) -> tuple[Any, Any]:
+def load_edef_model(args: argparse.Namespace) -> tuple[Any, Any, dict[str, Any]]:
+    task_metadata = load_task_metadata_from_dist_path(args.dist_path)
+    metadata_dist_dim = int(task_metadata["dist_dim"])
+    if args.dist_dim is not None and int(args.dist_dim) != metadata_dist_dim:
+        raise ValueError(
+            f"--dist_dim={args.dist_dim} does not match metadata dist_dim={metadata_dist_dim} in {args.dist_path}"
+        )
+    dist_dim = metadata_dist_dim
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
     model = AutoModelForCausalLM.from_pretrained(
         args.phase1_model,
@@ -160,7 +167,7 @@ def load_edef_model(args: argparse.Namespace) -> tuple[Any, Any]:
     )
 
     hidden_dim = int(getattr(model.config, "hidden_size", 2560))
-    model = attach_edef_to_model(model, dist_dim=args.dist_dim, hidden_dim=hidden_dim)
+    model = attach_edef_to_model(model, dist_dim=dist_dim, hidden_dim=hidden_dim)
     model = PeftModel.from_pretrained(model, args.model_path)
 
     edef_ckpt = os.path.join(args.model_path, "edef_checkpoint")
@@ -176,12 +183,12 @@ def load_edef_model(args: argparse.Namespace) -> tuple[Any, Any]:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    return model, tokenizer
+    return model, tokenizer, task_metadata
 
 
-def _build_prompt(tokenizer: Any, clinical_text: str) -> str:
+def _build_prompt(tokenizer: Any, instruction: str, clinical_text: str) -> str:
     messages = [
-        {"role": "system", "content": NER_INSTRUCTION},
+        {"role": "system", "content": instruction},
         {"role": "user", "content": clinical_text},
     ]
     return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -311,13 +318,14 @@ class _EdefEmbedHook:
 def _generate_with_mode(
     model: Any,
     tokenizer: Any,
+    instruction: str,
     clinical_text: str,
     word_entity_dist: dict[str, list[float]],
     default_dist: list[float],
     max_new_tokens: int,
     force_gate_zero: bool,
 ) -> tuple[str, torch.Tensor, torch.Tensor]:
-    prompt = _build_prompt(tokenizer, clinical_text)
+    prompt = _build_prompt(tokenizer, instruction, clinical_text)
     device = _model_device(model)
     encoding = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
     input_ids = encoding.input_ids.to(device)
@@ -361,6 +369,7 @@ def _generate_with_mode(
 def edef_generate(
     model: Any,
     tokenizer: Any,
+    instruction: str,
     clinical_text: str,
     word_entity_dist: dict[str, list[float]],
     default_dist: list[float],
@@ -369,6 +378,7 @@ def edef_generate(
     return _generate_with_mode(
         model,
         tokenizer,
+        instruction,
         clinical_text,
         word_entity_dist,
         default_dist,
@@ -380,6 +390,7 @@ def edef_generate(
 def ablation_generate(
     model: Any,
     tokenizer: Any,
+    instruction: str,
     clinical_text: str,
     word_entity_dist: dict[str, list[float]],
     default_dist: list[float],
@@ -388,6 +399,7 @@ def ablation_generate(
     generated, _, _ = _generate_with_mode(
         model,
         tokenizer,
+        instruction,
         clinical_text,
         word_entity_dist,
         default_dist,
@@ -400,6 +412,7 @@ def ablation_generate(
 def _generate_batch_with_mode(
     model: Any,
     tokenizer: Any,
+    instruction: str,
     batch_texts: list[str],
     word_entity_dist: dict[str, list[float]],
     default_dist: list[float],
@@ -415,7 +428,7 @@ def _generate_batch_with_mode(
     if not batch_texts:
         return [], [], []
 
-    prompts = [_build_prompt(tokenizer, text) for text in batch_texts]
+    prompts = [_build_prompt(tokenizer, instruction, text) for text in batch_texts]
     device = _model_device(model)
 
     original_padding_side = tokenizer.padding_side
@@ -592,12 +605,17 @@ def _summarize_gate_stats(
 
 
 def evaluate(args: argparse.Namespace) -> dict[str, Any]:
-    model, tokenizer = load_edef_model(args)
+    model, tokenizer, task_metadata = load_edef_model(args)
+    instruction = str(task_metadata["instruction"])
     word_entity_dist, default_dist = load_distributions(args.dist_path)
     entity_type_by_idx = _load_entity_type_index(args.dist_path)
-
-    with open(args.test_data, "r", encoding="utf-8") as f:
-        test_samples = json.load(f)
+    test_samples = load_ner_samples(
+        args.test_data,
+        split=args.test_split,
+        dataset_revision=args.dataset_revision,
+        cache_dir=args.cache_dir,
+        instruction=instruction,
+    )
     if args.max_samples is not None:
         test_samples = test_samples[: args.max_samples]
 
@@ -632,7 +650,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
 
             start = time.time()
             gen_texts, batch_gates, batch_dists = _generate_batch_with_mode(
-                model, tokenizer, batch_texts, word_entity_dist, default_dist,
+                model, tokenizer, instruction, batch_texts, word_entity_dist, default_dist,
                 max_new_tokens=args.max_new_tokens, force_gate_zero=False,
             )
             elapsed = time.time() - start
@@ -694,6 +712,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "model_path": args.model_path,
         "phase1_model": args.phase1_model,
         "test_data": args.test_data,
+        "test_split": args.test_split,
         "num_samples": len(test_samples),
         "avg_inference_time": (sum(timings) / len(timings)) if timings else 0.0,
         "baseline_f1": args.baseline_f1,
@@ -701,11 +720,12 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "edef_relaxed": eval_metrics["relaxed"],
         "edef_exact_f1": exact_f1_pct,
         "edef_relaxed_f1": relaxed_f1_pct,
-        "improvement_vs_baseline": exact_f1_pct - args.baseline_f1,
         "per_type": eval_metrics["per_type"],
         "gate_stats": gate_stats,
         "parse_errors": dict(parse_errors),
     }
+    if args.baseline_f1 is not None:
+        results["improvement_vs_baseline"] = exact_f1_pct - args.baseline_f1
 
     if args.run_ablation:
         print("\nRunning ablation (gate forced to zero)...")
@@ -722,7 +742,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
 
                 start = time.time()
                 gen_texts, _, _ = _generate_batch_with_mode(
-                    model, tokenizer, batch_texts, word_entity_dist, default_dist,
+                    model, tokenizer, instruction, batch_texts, word_entity_dist, default_dist,
                     max_new_tokens=args.max_new_tokens, force_gate_zero=True,
                 )
                 elapsed = time.time() - start
@@ -764,8 +784,9 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     if args.run_ablation:
         print(f"Ablation Exact F1: {results['ablation_exact_f1']:.2f}%")
         print(f"EDEF gain over ablation: +{results['edef_minus_ablation_f1']:.2f}%")
-    print(f"Baseline Exact F1: {args.baseline_f1:.2f}%")
-    print(f"Improvement vs baseline: {results['improvement_vs_baseline']:+.2f}%")
+    if args.baseline_f1 is not None:
+        print(f"Baseline Exact F1: {args.baseline_f1:.2f}%")
+        print(f"Improvement vs baseline: {results['improvement_vs_baseline']:+.2f}%")
     print(f"Results written to: {output_file}")
     print(f"Raw predictions:   {raw_pred_path}")
     print("=" * 80)
@@ -777,23 +798,27 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate EDEF-enhanced NER model")
     parser.add_argument("--model_path", type=str, default="saves/edef-stage2")
     parser.add_argument("--base_model", type=str, default="unsloth/Qwen3-4B-Instruct-2507")
-    parser.add_argument("--phase1_model", type=str, default="/workspace/Soft Prompt Tuning/qwen3-phase1-checkpoint")
+    parser.add_argument("--phase1_model", type=str, default=DEFAULT_PHASE1_MODEL_PATH)
     parser.add_argument(
         "--test_data",
         type=str,
-        default="/workspace/Soft Prompt Tuning/data/test_ner_filtered.json",
+        default=DEFAULT_DATASET_NAME,
+        help="Local JSON path or Hugging Face dataset repo id for test data.",
     )
     parser.add_argument(
         "--dist_path",
         type=str,
-        default="/workspace/Soft Prompt Tuning/entity_distributions.json",
+        default=DEFAULT_DIST_PATH,
     )
+    parser.add_argument("--test_split", type=str, default="test")
+    parser.add_argument("--dataset_revision", type=str, default=None)
+    parser.add_argument("--cache_dir", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default="evaluation_results")
     parser.add_argument("--max_new_tokens", type=int, default=2048)
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size for inference (reduce if OOM)")
     parser.add_argument("--max_samples", type=int, default=None)
-    parser.add_argument("--baseline_f1", type=float, default=85.07)
-    parser.add_argument("--dist_dim", type=int, default=45)
+    parser.add_argument("--baseline_f1", type=float, default=None)
+    parser.add_argument("--dist_dim", type=int, default=None)
     parser.add_argument("--gate_samples", type=int, default=100)
 
     parser.add_argument("--run_ablation", dest="run_ablation", action="store_true")

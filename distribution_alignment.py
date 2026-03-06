@@ -1,5 +1,6 @@
 import json
 import re
+from pathlib import Path
 from typing import Protocol, cast
 
 import torch
@@ -115,7 +116,47 @@ def load_distributions(dist_path: str) -> tuple[dict[str, list[float]], list[flo
         for k, v in raw.items()
         if isinstance(v, list)
     }
-    default_dist = [0.0] * 44 + [1.0]
+
+    dist_file = Path(dist_path).resolve()
+    stats_path = dist_file.with_name("distribution_stats.json")
+    index_path = dist_file.with_name("entity_type_index.json")
+
+    default_dist: list[float] | None = None
+    if stats_path.exists():
+        try:
+            with stats_path.open("r", encoding="utf-8") as f:
+                stats_raw = cast(dict[str, object], json.load(f))
+            default_candidate = stats_raw.get("default_unknown_distribution")
+            if isinstance(default_candidate, list):
+                default_dist = _to_float_list(default_candidate)
+        except (json.JSONDecodeError, OSError):
+            default_dist = None
+
+    vector_dim = len(next(iter(word_entity_dist.values()), []))
+    if default_dist is None:
+        if vector_dim == 0 and index_path.exists():
+            try:
+                with index_path.open("r", encoding="utf-8") as f:
+                    index_raw = cast(dict[str, object], json.load(f))
+                numeric_indices = [
+                    _to_int(value) for value in index_raw.values() if _to_int(value) >= 0
+                ]
+                if numeric_indices:
+                    vector_dim = max(numeric_indices) + 1
+            except (json.JSONDecodeError, OSError):
+                vector_dim = 0
+
+        if vector_dim == 0:
+            vector_dim = 45
+
+        default_dist = [0.0] * vector_dim
+        default_dist[-1] = 1.0
+    elif vector_dim and len(default_dist) != vector_dim:
+        # Prefer the metadata file when present, but keep dimensions aligned with the vectors on disk.
+        default_dist = default_dist[:vector_dim]
+        if len(default_dist) < vector_dim:
+            default_dist = default_dist + [0.0] * (vector_dim - len(default_dist))
+
     return word_entity_dist, default_dist
 
 

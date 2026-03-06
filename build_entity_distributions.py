@@ -3,215 +3,200 @@
 import argparse
 import json
 import logging
+import os
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
-
-NER_PREFIX = "You are an expert medical Named Entity Recognition (NER) assistant"
+from ner_dataset_utils import (
+    DEFAULT_ARTIFACT_DIR,
+    DEFAULT_DATASET_NAME,
+    build_ner_instruction,
+    extract_entity_types_from_samples,
+    load_ner_samples,
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build per-word entity type probability distributions from NER training data."
+        description="Build per-token entity type distributions from a local JSON file or Hugging Face dataset."
     )
     parser.add_argument(
-        "--labels-path",
-        type=Path,
-        default=Path("/home/anurag/NER/Multi-task Finetuning/Labels_NER.txt"),
-        help="Path to Labels_NER.txt",
+        "--data_source",
+        type=str,
+        default=DEFAULT_DATASET_NAME,
+        help="Local JSON path or Hugging Face dataset repo id.",
     )
     parser.add_argument(
-        "--phase1-train-path",
-        type=Path,
-        default=Path(
-            "/home/anurag/NER/Multi-task Finetuning/Multitask Finetuning Phase1 Dataset/train.json"
-        ),
-        help="Path to Phase 1 train.json",
+        "--count_split",
+        type=str,
+        default="train",
+        help="Split used for distribution counts when --data_source is a dataset repo.",
     )
     parser.add_argument(
-        "--phase2-train-path",
-        type=Path,
-        default=Path(
-            "/home/anurag/NER/Multi-task Finetuning/Multitask Finetuning Phase 2 Dataset/train_ner_filtered.json"
-        ),
-        help="Path to Phase 2 train_ner_filtered.json",
+        "--label_splits",
+        nargs="+",
+        default=["train", "validation", "test"],
+        help="Splits scanned to discover the full entity type inventory.",
     )
     parser.add_argument(
-        "--out-dir",
+        "--dataset_revision",
+        type=str,
+        default=None,
+        help="Optional dataset revision for Hugging Face Hub loading.",
+    )
+    parser.add_argument(
+        "--cache_dir",
+        type=str,
+        default=None,
+        help="Optional Hugging Face cache directory.",
+    )
+    parser.add_argument(
+        "--out_dir",
         type=Path,
-        default=Path("/home/anurag/NER/Soft Prompt Tuning"),
-        help="Output directory for JSON files",
+        default=DEFAULT_ARTIFACT_DIR,
+        help="Output directory for the generated distribution files.",
     )
     return parser.parse_args()
 
 
-def load_entity_types(labels_path: Path) -> list[str]:
-    entity_types: list[str] = []
-    with labels_path.open("r", encoding="utf-8") as f:
-        for raw_line in f:
-            line = raw_line.strip()
-            if not line:
-                continue
-            if "|" in line:
-                line = line.split("|", 1)[1].strip()
-            entity_types.append(line)
-    return entity_types
+def _normalize_token(token: str) -> str:
+    normalized = token.strip().lower().strip("`'\".,;:!?()[]{}")
+    if not normalized:
+        return ""
+    if not any(ch.isalnum() for ch in normalized):
+        return ""
+    return normalized
 
 
-def load_json_array(path: Path) -> list[dict]:
-    with path.open("r", encoding="utf-8") as f:
-        data = json.load(f)
-    if not isinstance(data, list):
-        raise ValueError(f"Expected top-level JSON array in {path}, got {type(data)}")
-    return data
+def _process_tokenized_sample(
+    sample: dict[str, Any],
+    type_to_idx: dict[str, int],
+    o_idx: int,
+    word_entity_counts: dict[str, np.ndarray],
+) -> bool:
+    tokens = sample.get("tokens")
+    if not isinstance(tokens, list):
+        return False
+
+    normalized_tokens = [_normalize_token(str(token)) for token in tokens]
+    token_labels = [o_idx] * len(normalized_tokens)
+
+    entities = sample.get("entities", [])
+    if not isinstance(entities, list):
+        return False
+
+    for entity in entities:
+        if not isinstance(entity, dict):
+            return False
+
+        entity_type = str(entity.get("type", "")).strip()
+        type_idx = type_to_idx.get(entity_type)
+        token_start = entity.get("token_start")
+        token_end = entity.get("token_end")
+        if (
+            type_idx is None
+            or not isinstance(token_start, int)
+            or not isinstance(token_end, int)
+            or token_start < 0
+            or token_end < token_start
+            or token_end >= len(normalized_tokens)
+        ):
+            return False
+
+        for pos in range(token_start, token_end + 1):
+            token_labels[pos] = type_idx
+
+    for token, label_idx in zip(normalized_tokens, token_labels):
+        if token:
+            word_entity_counts[token][label_idx] += 1.0
+
+    return True
 
 
-def parse_output_payload(output_value, sample_idx: int, source_name: str):
-    if isinstance(output_value, dict):
-        return output_value
-    if isinstance(output_value, str):
-        try:
-            return json.loads(output_value)
-        except json.JSONDecodeError as exc:
-            logging.warning(
-                "Skipping sample %d from %s: output JSON parse failed: %s",
-                sample_idx,
-                source_name,
-                exc,
-            )
-            return None
-    logging.warning(
-        "Skipping sample %d from %s: unsupported output type %s",
-        sample_idx,
-        source_name,
-        type(output_value),
-    )
-    return None
+def _process_word_fallback_sample(
+    sample: dict[str, Any],
+    type_to_idx: dict[str, int],
+    o_idx: int,
+    word_entity_counts: dict[str, np.ndarray],
+) -> None:
+    text = str(sample.get("text", sample.get("input", "")))
+    text_words = [_normalize_token(token) for token in text.split()]
+    text_words = [word for word in text_words if word]
+    text_counter = Counter(text_words)
+    entity_word_counter: Counter[str] = Counter()
+
+    entities = sample.get("entities", [])
+    if not isinstance(entities, list):
+        return
+
+    for entity in entities:
+        if not isinstance(entity, dict):
+            continue
+
+        entity_type = str(entity.get("type", "")).strip()
+        type_idx = type_to_idx.get(entity_type)
+        if type_idx is None:
+            continue
+
+        entity_words = [_normalize_token(token) for token in str(entity.get("text", "")).split()]
+        entity_words = [word for word in entity_words if word]
+        for word in entity_words:
+            word_entity_counts[word][type_idx] += 1.0
+            entity_word_counter[word] += 1
+
+    for word, total_occ in text_counter.items():
+        o_count = total_occ - entity_word_counter.get(word, 0)
+        if o_count > 0:
+            word_entity_counts[word][o_idx] += float(o_count)
 
 
 def process_samples(
-    samples: list[dict],
-    source_name: str,
+    samples: list[dict[str, Any]],
     type_to_idx: dict[str, int],
-    type_to_idx_casefold: dict[str, int],
     o_idx: int,
-    word_entity_counts,
-    start_processed: int,
-) -> tuple[int, int]:
-    processed = start_processed
-    valid_ner_samples = 0
+    word_entity_counts: dict[str, np.ndarray],
+) -> dict[str, int]:
+    processed = 0
+    tokenized_samples = 0
+    fallback_samples = 0
 
-    for i, sample in enumerate(samples):
-        try:
-            instruction = str(sample.get("instruction", ""))
-            if source_name == "phase1" and not instruction.startswith(NER_PREFIX):
-                continue
+    for sample in samples:
+        if _process_tokenized_sample(sample, type_to_idx, o_idx, word_entity_counts):
+            tokenized_samples += 1
+        else:
+            _process_word_fallback_sample(sample, type_to_idx, o_idx, word_entity_counts)
+            fallback_samples += 1
+        processed += 1
 
-            text = str(sample.get("input", ""))
-            output_value = sample.get("output", "")
-            output_payload = parse_output_payload(output_value, i, source_name)
-            if output_payload is None:
-                continue
-
-            entities = output_payload.get("ner", [])
-            if not isinstance(entities, list):
-                logging.warning(
-                    "Skipping sample %d from %s: 'ner' is not a list",
-                    i,
-                    source_name,
-                )
-                continue
-
-            valid_ner_samples += 1
-            text_words = [w for w in text.lower().split() if w]
-            text_counter = Counter(text_words)
-            entity_word_counter: Counter[str] = Counter()
-
-            text_lower = text.lower()
-
-            for entity in entities:
-                if not isinstance(entity, (list, tuple)) or len(entity) != 2:
-                    logging.warning(
-                        "Skipping malformed entity in sample %d from %s: %r",
-                        i,
-                        source_name,
-                        entity,
-                    )
-                    continue
-
-                entity_text, entity_type = entity
-                entity_text = str(entity_text)
-                entity_type = str(entity_type)
-
-                type_idx = type_to_idx.get(entity_type)
-                if type_idx is None:
-                    type_idx = type_to_idx_casefold.get(entity_type.casefold())
-
-                if type_idx is None:
-                    logging.warning(
-                        "Unknown entity type '%s' in sample %d from %s; skipping entity",
-                        entity_type,
-                        i,
-                        source_name,
-                    )
-                    continue
-
-                entity_words = [w for w in entity_text.lower().split() if w]
-                if not entity_words:
-                    continue
-
-                if entity_text.lower() not in text_lower:
-                    logging.warning(
-                        "Entity text not found in input (sample %d, %s): '%s'",
-                        i,
-                        source_name,
-                        entity_text,
-                    )
-
-                for word in entity_words:
-                    word_entity_counts[word][type_idx] += 1.0
-                    entity_word_counter[word] += 1
-
-            for word, total_occ in text_counter.items():
-                o_count = total_occ - entity_word_counter.get(word, 0)
-                if o_count > 0:
-                    word_entity_counts[word][o_idx] += float(o_count)
-
-            processed += 1
-            if processed % 10000 == 0:
-                logging.info("Processed %d samples so far...", processed)
-
-        except Exception as exc:
-            logging.warning(
-                "Skipping sample %d from %s due to error: %s",
-                i,
-                source_name,
-                exc,
-            )
-            continue
-
-    return processed, valid_ner_samples
+    return {
+        "processed": processed,
+        "tokenized_samples": tokenized_samples,
+        "fallback_samples": fallback_samples,
+    }
 
 
 def top_words_for_type(
-    word_entity_dist: dict[str, list[float]], type_idx: int, top_k: int = 10
-) -> list[dict]:
+    word_entity_dist: dict[str, list[float]],
+    type_idx: int,
+    top_k: int = 10,
+) -> list[dict[str, Any]]:
     ranked = sorted(
         ((word, probs[type_idx]) for word, probs in word_entity_dist.items()),
-        key=lambda x: x[1],
+        key=lambda item: item[1],
         reverse=True,
     )
     return [
-        {"word": word, "probability": float(prob)}
-        for word, prob in ranked[:top_k]
-        if prob > 0.0
+        {"word": word, "probability": float(probability)}
+        for word, probability in ranked[:top_k]
+        if probability > 0.0
     ]
 
 
-def build_distributions(word_entity_counts) -> dict[str, list[float]]:
+def build_distributions(word_entity_counts: dict[str, np.ndarray]) -> dict[str, list[float]]:
     word_entity_dist: dict[str, list[float]] = {}
     for word, counts in word_entity_counts.items():
         total = counts.sum()
@@ -222,119 +207,86 @@ def build_distributions(word_entity_counts) -> dict[str, list[float]]:
 
 def print_sanity_checks(
     word_entity_dist: dict[str, list[float]],
+    entity_types: list[str],
     type_to_idx: dict[str, int],
     words_with_entity_signal: int,
 ) -> None:
     print("\n=== Sanity Checks ===")
-    for type_name in [
-        "Drug",
-        "Medical_Condition",
-        "Sign_Symptom",
-        "Anatomical_Structure",
-    ]:
-        if type_name not in type_to_idx:
-            print(f"- {type_name}: type not found")
-            continue
+    for type_name in entity_types[: min(4, len(entity_types))]:
         idx = type_to_idx[type_name]
-        ranked = sorted(
-            ((word, probs[idx]) for word, probs in word_entity_dist.items()),
-            key=lambda x: x[1],
-            reverse=True,
-        )
-        top5 = [(w, float(p)) for w, p in ranked[:5] if p > 0.0]
-        print(f"- Top 5 for {type_name}: {top5}")
-
-    print("\nCommon word distributions:")
-    for word in ["the", "pain", "mg", "blood"]:
-        dist = word_entity_dist.get(word)
-        if dist is None:
-            print(f"- {word}: not in vocabulary")
-        else:
-            print(f"- {word}: {dist}")
+        top_words = top_words_for_type(word_entity_dist, idx, top_k=5)
+        print(f"- Top 5 for {type_name}: {top_words}")
 
     print("\nVocabulary summary:")
     print(f"- Total unique words: {len(word_entity_dist)}")
     print(f"- Words with entity signal: {words_with_entity_signal}")
 
 
+def _load_label_samples(args: argparse.Namespace) -> list[dict[str, Any]]:
+    if os.path.exists(args.data_source):
+        logging.info("Loading local JSON samples from %s", args.data_source)
+        return load_ner_samples(args.data_source)
+
+    all_samples: list[dict[str, Any]] = []
+    for split_name in args.label_splits:
+        logging.info("Loading label inventory split '%s' from %s", split_name, args.data_source)
+        all_samples.extend(
+            load_ner_samples(
+                args.data_source,
+                split=split_name,
+                dataset_revision=args.dataset_revision,
+                cache_dir=args.cache_dir,
+            )
+        )
+    return all_samples
+
+
+def _load_count_samples(args: argparse.Namespace) -> list[dict[str, Any]]:
+    if os.path.exists(args.data_source):
+        return load_ner_samples(args.data_source)
+
+    logging.info("Loading count split '%s' from %s", args.count_split, args.data_source)
+    return load_ner_samples(
+        args.data_source,
+        split=args.count_split,
+        dataset_revision=args.dataset_revision,
+        cache_dir=args.cache_dir,
+    )
+
+
 def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-
     start_time = time.time()
 
-    entity_types = load_entity_types(args.labels_path)
-    if len(entity_types) != 44:
-        logging.warning("Expected 44 entity types, found %d", len(entity_types))
+    label_samples = _load_label_samples(args)
+    entity_types = extract_entity_types_from_samples(label_samples)
+    if not entity_types:
+        raise ValueError("No entity types were found in the provided dataset.")
 
     type_to_idx = {name: idx for idx, name in enumerate(entity_types)}
-    type_to_idx_casefold = {name.casefold(): idx for name, idx in type_to_idx.items()}
     o_idx = len(entity_types)
     type_to_idx["O"] = o_idx
     dist_dim = o_idx + 1
 
-    logging.info("Loaded %d entity types. Distribution dim=%d", len(entity_types), dist_dim)
+    logging.info("Discovered entity types: %s", entity_types)
+    logging.info("Distribution dimension: %d", dist_dim)
 
-    word_entity_counts = defaultdict(lambda: np.zeros(dist_dim, dtype=np.float64))
-
-    logging.info("Loading Phase 1 dataset from %s", args.phase1_train_path)
-    phase1_load_start = time.time()
-    phase1_samples = load_json_array(args.phase1_train_path)
-    logging.info(
-        "Phase 1 loaded: %d samples (%.2fs)",
-        len(phase1_samples),
-        time.time() - phase1_load_start,
+    count_samples = _load_count_samples(args)
+    word_entity_counts: dict[str, np.ndarray] = defaultdict(
+        lambda: np.zeros(dist_dim, dtype=np.float64)
     )
-
-    logging.info("Loading Phase 2 dataset from %s", args.phase2_train_path)
-    phase2_load_start = time.time()
-    phase2_samples = load_json_array(args.phase2_train_path)
-    logging.info(
-        "Phase 2 loaded: %d samples (%.2fs)",
-        len(phase2_samples),
-        time.time() - phase2_load_start,
-    )
-
-    processed = 0
-    phase1_process_start = time.time()
-    processed, phase1_ner_samples = process_samples(
-        samples=phase1_samples,
-        source_name="phase1",
+    process_summary = process_samples(
+        samples=count_samples,
         type_to_idx=type_to_idx,
-        type_to_idx_casefold=type_to_idx_casefold,
         o_idx=o_idx,
         word_entity_counts=word_entity_counts,
-        start_processed=processed,
-    )
-    logging.info(
-        "Phase 1 NER samples processed: %d (%.2fs)",
-        phase1_ner_samples,
-        time.time() - phase1_process_start,
-    )
-
-    phase2_process_start = time.time()
-    processed, phase2_ner_samples = process_samples(
-        samples=phase2_samples,
-        source_name="phase2",
-        type_to_idx=type_to_idx,
-        type_to_idx_casefold=type_to_idx_casefold,
-        o_idx=o_idx,
-        word_entity_counts=word_entity_counts,
-        start_processed=processed,
-    )
-    logging.info(
-        "Phase 2 NER samples processed: %d (%.2fs)",
-        phase2_ner_samples,
-        time.time() - phase2_process_start,
     )
 
     word_entity_dist = build_distributions(word_entity_counts)
-
-    words_with_entity_signal = 0
-    for probs in word_entity_dist.values():
-        if int(np.argmax(np.asarray(probs))) != o_idx:
-            words_with_entity_signal += 1
-
+    words_with_entity_signal = sum(
+        1 for probs in word_entity_dist.values() if int(np.argmax(np.asarray(probs))) != o_idx
+    )
     total_unique_words = len(word_entity_dist)
     vocabulary_coverage = (
         (words_with_entity_signal / total_unique_words) * 100.0
@@ -342,24 +294,36 @@ def main() -> None:
         else 0.0
     )
 
+    entity_counts = Counter(
+        str(entity.get("type", "")).strip()
+        for sample in label_samples
+        for entity in sample.get("entities", [])
+        if str(entity.get("type", "")).strip()
+    )
     per_type_top10 = {
-        type_name: top_words_for_type(word_entity_dist, idx, top_k=10)
-        for type_name, idx in type_to_idx.items()
-        if type_name != "O"
+        type_name: top_words_for_type(word_entity_dist, type_to_idx[type_name], top_k=10)
+        for type_name in entity_types
     }
-
+    prompt_instruction = build_ner_instruction(entity_types)
     default_dist = [0.0] * len(entity_types) + [1.0]
 
     stats = {
+        "data_source": args.data_source,
+        "count_split": args.count_split,
+        "label_splits": args.label_splits,
+        "entity_types": entity_types,
+        "entity_type_counts": dict(entity_counts),
+        "distribution_dim": dist_dim,
+        "o_index": o_idx,
+        "prompt_instruction": prompt_instruction,
+        "default_unknown_distribution": default_dist,
         "total_unique_words": total_unique_words,
         "words_with_entity_signal": words_with_entity_signal,
         "vocabulary_coverage": vocabulary_coverage,
+        "samples_processed": process_summary["processed"],
+        "tokenized_samples": process_summary["tokenized_samples"],
+        "fallback_samples": process_summary["fallback_samples"],
         "per_type_top10": per_type_top10,
-        "total_samples_processed": phase1_ner_samples + phase2_ner_samples,
-        "phase1_ner_samples": phase1_ner_samples,
-        "phase2_ner_samples": phase2_ner_samples,
-        "distribution_dim": dist_dim,
-        "default_unknown_distribution": default_dist,
     }
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -369,10 +333,8 @@ def main() -> None:
 
     with dist_path.open("w", encoding="utf-8") as f:
         json.dump(word_entity_dist, f, ensure_ascii=True)
-
     with type_idx_path.open("w", encoding="utf-8") as f:
         json.dump(type_to_idx, f, ensure_ascii=True, indent=2)
-
     with stats_path.open("w", encoding="utf-8") as f:
         json.dump(stats, f, ensure_ascii=True, indent=2)
 
@@ -382,11 +344,12 @@ def main() -> None:
     print(f"Entity type index written to: {type_idx_path}")
     print(f"Distribution stats written to: {stats_path}")
     print(f"Total processing time: {elapsed:.2f}s")
-    print(f"Total samples processed: {phase1_ner_samples + phase2_ner_samples}")
-    print(f"Phase 1 NER samples: {phase1_ner_samples}")
-    print(f"Phase 2 NER samples: {phase2_ner_samples}")
+    print(f"Samples processed for counts: {process_summary['processed']}")
+    print(f"Tokenized-path samples: {process_summary['tokenized_samples']}")
+    print(f"Fallback-path samples: {process_summary['fallback_samples']}")
+    print(f"Entity types: {', '.join(entity_types)}")
 
-    print_sanity_checks(word_entity_dist, type_to_idx, words_with_entity_signal)
+    print_sanity_checks(word_entity_dist, entity_types, type_to_idx, words_with_entity_signal)
 
 
 if __name__ == "__main__":

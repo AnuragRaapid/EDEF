@@ -13,40 +13,53 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 if __package__:
     _dist_mod = importlib.import_module(".distribution_alignment", package=__package__)
     _edef_mod = importlib.import_module(".edef_model", package=__package__)
+    _dataset_utils_mod = importlib.import_module(".ner_dataset_utils", package=__package__)
 else:
     _dist_mod = importlib.import_module("distribution_alignment")
     _edef_mod = importlib.import_module("edef_model")
+    _dataset_utils_mod = importlib.import_module("ner_dataset_utils")
 
 get_token_distributions = _dist_mod.get_token_distributions
 load_distributions = _dist_mod.load_distributions
 attach_edef_to_model = _edef_mod.attach_edef_to_model
 load_edef_checkpoint = _edef_mod.load_edef_checkpoint
-
-
-NER_INSTRUCTION = (
-    "You are an expert medical Named Entity Recognition (NER) assistant. "
-    "Your task is to extract and classify entities from the provided medical text. "
-    "Output format should be {'ner': [['entity', 'type'], ['entity', 'type'],...]}"
-)
+DEFAULT_DIST_PATH = _dataset_utils_mod.DEFAULT_DIST_PATH
+DEFAULT_PHASE1_MODEL_PATH = _dataset_utils_mod.DEFAULT_PHASE1_MODEL_PATH
+load_task_metadata_from_dist_path = _dataset_utils_mod.load_task_metadata_from_dist_path
 
 
 def parse_ner_output(text):
     """Parse model output to extract NER entities."""
+    import ast
     import json
     import re
 
+    cleaned = re.sub(r"^assistant\s*", "", text.strip(), flags=re.IGNORECASE)
+
     try:
-        data = json.loads(text.strip())
+        data = json.loads(cleaned)
         return data
     except json.JSONDecodeError:
         pass
 
-    match = re.search(r'\{.*"ner".*\}', text, re.DOTALL)
+    try:
+        data = ast.literal_eval(cleaned)
+        if isinstance(data, dict):
+            return data
+    except (ValueError, SyntaxError):
+        pass
+
+    match = re.search(r"\{.*['\"]ner['\"].*\}", cleaned, re.DOTALL)
     if match:
         try:
             return json.loads(match.group())
         except json.JSONDecodeError:
-            pass
+            try:
+                data = ast.literal_eval(match.group())
+                if isinstance(data, dict):
+                    return data
+            except (ValueError, SyntaxError):
+                pass
     return {"ner": []}
 
 
@@ -64,9 +77,9 @@ def _find_edef_host(model: Any) -> Any:
     return None
 
 
-def _build_chat_prompt(tokenizer: Any, text: str) -> str:
+def _build_chat_prompt(tokenizer: Any, instruction: str, text: str) -> str:
     messages = [
-        {"role": "system", "content": NER_INSTRUCTION},
+        {"role": "system", "content": instruction},
         {"role": "user", "content": text},
     ]
     if hasattr(tokenizer, "apply_chat_template"):
@@ -78,7 +91,7 @@ def _build_chat_prompt(tokenizer: Any, text: str) -> str:
             )
         except TypeError:
             return tokenizer.apply_chat_template(messages, tokenize=False)
-    return f"{NER_INSTRUCTION}\n\n{text}"
+    return f"{instruction}\n\n{text}"
 
 
 def _resolve_torch_dtype(dtype_name: str) -> torch.dtype | str:
@@ -101,10 +114,9 @@ class EDEFInferencePipeline:
         pipeline = EDEFInferencePipeline.from_pretrained(
             model_path="saves/edef-stage2",
             phase1_model="saves/phase1_merged",
-            dist_path="entity_distributions.json",
+            dist_path="artifacts/ncbi_disease/entity_distributions.json",
         )
-        result = pipeline.predict("Patient has chest pain and takes 500 mg aspirin.")
-        # Returns: {"ner": [["chest pain", "Sign_Symptom"], ["500 mg", "Dose_Med"], ["aspirin", "Drug"]]}
+        result = pipeline.predict("Familial Mediterranean fever was diagnosed in the patient.")
     """
 
     def __init__(
@@ -113,12 +125,14 @@ class EDEFInferencePipeline:
         tokenizer: Any,
         word_entity_dist: dict[str, list[float]],
         default_dist: list[float],
+        instruction: str,
         dist_dim: int = 45,
     ):
         self.model = model
         self.tokenizer = tokenizer
         self.word_entity_dist = word_entity_dist
         self.default_dist = default_dist
+        self.instruction = instruction
         self.dist_dim = dist_dim
 
         host = _find_edef_host(model)
@@ -135,12 +149,19 @@ class EDEFInferencePipeline:
         phase1_model: str,
         dist_path: str,
         base_model: str = "Qwen/Qwen3-4B-Instruct",
-        dist_dim: int = 45,
+        dist_dim: int | None = None,
         hidden_dim: int | None = None,
         device_map: str = "auto",
         torch_dtype: str = "auto",
         trust_remote_code: bool = True,
     ):
+        task_metadata = load_task_metadata_from_dist_path(dist_path)
+        metadata_dist_dim = int(task_metadata["dist_dim"])
+        if dist_dim is not None and int(dist_dim) != metadata_dist_dim:
+            raise ValueError(
+                f"dist_dim={dist_dim} does not match metadata dist_dim={metadata_dist_dim} in {dist_path}"
+            )
+        effective_dist_dim = metadata_dist_dim
         dtype = _resolve_torch_dtype(torch_dtype)
 
         model_source = phase1_model if phase1_model else base_model
@@ -152,7 +173,7 @@ class EDEFInferencePipeline:
         )
 
         hidden = hidden_dim if hidden_dim is not None else getattr(model.config, "hidden_size", 2560)
-        model = attach_edef_to_model(model, dist_dim=dist_dim, hidden_dim=hidden)
+        model = attach_edef_to_model(model, dist_dim=effective_dist_dim, hidden_dim=hidden)
         model = PeftModel.from_pretrained(model, model_path)
 
         edef_ckpt = os.path.join(model_path, "edef_checkpoint")
@@ -171,7 +192,14 @@ class EDEFInferencePipeline:
         word_entity_dist, default_dist = load_distributions(dist_path)
 
         model.eval()
-        return cls(model, tokenizer, word_entity_dist, default_dist, dist_dim=dist_dim)
+        return cls(
+            model,
+            tokenizer,
+            word_entity_dist,
+            default_dist,
+            instruction=str(task_metadata["instruction"]),
+            dist_dim=effective_dist_dim,
+        )
 
     def _build_fused_embeddings(self, prompt_text: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         encoding = self.tokenizer(
@@ -212,7 +240,7 @@ class EDEFInferencePipeline:
         return input_ids, attention_mask, fused_embeds
 
     def predict(self, text: str, max_new_tokens: int = 2048, temperature: float = 0.0):
-        prompt_text = _build_chat_prompt(self.tokenizer, text)
+        prompt_text = _build_chat_prompt(self.tokenizer, self.instruction, text)
 
         with torch.no_grad():
             input_ids, attention_mask, fused_embeds = self._build_fused_embeddings(prompt_text)
@@ -232,7 +260,8 @@ class EDEFInferencePipeline:
             output_ids = self.model.generate(**generate_kwargs)
 
         prompt_len = input_ids.shape[1]
-        completion_ids = output_ids[0, prompt_len:]
+        generated_ids = output_ids[0]
+        completion_ids = generated_ids[prompt_len:] if generated_ids.shape[0] > prompt_len else generated_ids
         decoded = self.tokenizer.decode(completion_ids, skip_special_tokens=True)
         return parse_ner_output(decoded)
 
@@ -261,9 +290,9 @@ def _load_texts_from_json(input_file: str) -> list[str]:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="EDEF-enhanced clinical NER inference")
     parser.add_argument("--model_path", required=True, help="Stage 2 model path (LoRA + EDEF)")
-    parser.add_argument("--phase1_model", required=True, help="Phase 1 merged model path")
+    parser.add_argument("--phase1_model", default=DEFAULT_PHASE1_MODEL_PATH, help="Phase 1 merged model path")
     parser.add_argument("--base_model", default="Qwen/Qwen3-4B-Instruct", help="Base model name")
-    parser.add_argument("--dist_path", required=True, help="Entity distributions JSON")
+    parser.add_argument("--dist_path", default=DEFAULT_DIST_PATH, help="Entity distributions JSON")
 
     io_group = parser.add_mutually_exclusive_group(required=True)
     io_group.add_argument("--input", help="Single text to process")
