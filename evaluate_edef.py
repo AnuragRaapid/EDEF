@@ -607,7 +607,7 @@ def _summarize_gate_stats(
 def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     model, tokenizer, task_metadata = load_edef_model(args)
     instruction = str(task_metadata["instruction"])
-    word_entity_dist, default_dist = load_distributions(args.dist_path)
+    word_entity_dist, default_dist, _ngram_dist = load_distributions(args.dist_path)
     entity_type_by_idx = _load_entity_type_index(args.dist_path)
     test_samples = load_ner_samples(
         args.test_data,

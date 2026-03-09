@@ -126,6 +126,8 @@ def parse_args():
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--save_steps", type=int, default=500)
     parser.add_argument("--gate_log_steps", type=int, default=100)
+    parser.add_argument("--dist_dropout", type=float, default=0.2)
+    parser.add_argument("--no_refiner", action="store_true")
     return parser.parse_args()
 
 
@@ -204,7 +206,11 @@ def main():
         param.requires_grad = False
 
     hidden_dim = getattr(model.config, "hidden_size", 2560)
-    model = attach_edef_to_model(model, dist_dim=dist_dim, hidden_dim=hidden_dim)
+    model = attach_edef_to_model(
+        model, dist_dim=dist_dim, hidden_dim=hidden_dim,
+        dist_dropout=getattr(args, "dist_dropout", 0.2),
+        use_refiner=not getattr(args, "no_refiner", False),
+    )
 
     for param in model.entity_projector.parameters():
         param.requires_grad = True

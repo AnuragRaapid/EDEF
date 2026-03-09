@@ -65,14 +65,25 @@ def _align_dist_to_seq(
     return aligned
 
 
-def attach_edef_to_model(model, dist_dim=45, hidden_dim=2560):
+def attach_edef_to_model(
+    model,
+    dist_dim=45,
+    hidden_dim=2560,
+    dist_dropout=0.2,
+    use_refiner=True,
+    refiner_hidden=64,
+):
     from edef_modules import EntityDistProjector, GatedFusion
 
-    # Detect model dtype/device to match EDEF modules
     model_dtype = next(model.parameters()).dtype
     model_device = next(model.parameters()).device
 
-    model.entity_projector = EntityDistProjector(dist_dim, hidden_dim).to(dtype=model_dtype, device=model_device)
+    model.entity_projector = EntityDistProjector(
+        dist_dim, hidden_dim,
+        dist_dropout=dist_dropout,
+        use_refiner=use_refiner,
+        refiner_hidden=refiner_hidden,
+    ).to(dtype=model_dtype, device=model_device)
     model.fusion_gate = GatedFusion(hidden_dim).to(dtype=model_dtype, device=model_device)
 
     original_forward = model.forward
@@ -104,10 +115,23 @@ def attach_edef_to_model(model, dist_dim=45, hidden_dim=2560):
 
 
 class EDEFWrapper(nn.Module):
-    def __init__(self, model: nn.Module, dist_dim: int = 45, hidden_dim: int = 2560) -> None:
+    def __init__(
+        self,
+        model: nn.Module,
+        dist_dim: int = 45,
+        hidden_dim: int = 2560,
+        dist_dropout: float = 0.2,
+        use_refiner: bool = True,
+        refiner_hidden: int = 64,
+    ) -> None:
         super().__init__()
         self.model = model
-        self.entity_projector = EntityDistProjector(dist_dim, hidden_dim)
+        self.entity_projector = EntityDistProjector(
+            dist_dim, hidden_dim,
+            dist_dropout=dist_dropout,
+            use_refiner=use_refiner,
+            refiner_hidden=refiner_hidden,
+        )
         self.fusion_gate = GatedFusion(hidden_dim)
         self._dist_vectors = None
         embed_tokens = _get_embed_tokens_module(self.model)

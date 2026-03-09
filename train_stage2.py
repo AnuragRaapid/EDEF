@@ -44,6 +44,17 @@ load_task_metadata_from_dist_path = _dataset_utils_mod.load_task_metadata_from_d
 
 
 class EDEFTrainer(Trainer):
+    """Custom trainer with optional entity-weighted loss.
+
+    When ``entity_loss_weight`` > 1.0 the loss on non-masked (output) tokens
+    is upweighted so the model pays more attention to producing correct entity
+    text rather than the surrounding template tokens.
+    """
+
+    def __init__(self, *args: Any, entity_loss_weight: float = 1.0, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self.entity_loss_weight = entity_loss_weight
+
     def compute_loss(
         self,
         model: Any,
@@ -51,12 +62,40 @@ class EDEFTrainer(Trainer):
         return_outputs: bool = False,
         num_items_in_batch: Any = None,
     ):
-        return super().compute_loss(
-            model,
-            inputs,
-            return_outputs=return_outputs,
-            num_items_in_batch=num_items_in_batch,
-        )
+        if self.entity_loss_weight <= 1.0:
+            return super().compute_loss(
+                model, inputs,
+                return_outputs=return_outputs,
+                num_items_in_batch=num_items_in_batch,
+            )
+
+        labels = inputs.get("labels")
+        outputs = model(**inputs)
+        logits = outputs.get("logits") if isinstance(outputs, dict) else getattr(outputs, "logits", None)
+
+        if logits is None or labels is None:
+            return super().compute_loss(
+                model, inputs,
+                return_outputs=return_outputs,
+                num_items_in_batch=num_items_in_batch,
+            )
+
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+
+        loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
+        flat_logits = shift_logits.view(-1, shift_logits.size(-1))
+        flat_labels = shift_labels.view(-1)
+
+        per_token_loss = loss_fct(flat_logits, flat_labels)
+
+        valid_mask = (flat_labels != -100).float()
+        weights = valid_mask * self.entity_loss_weight
+        weights = torch.where(valid_mask > 0, weights, torch.zeros_like(weights))
+
+        loss = (per_token_loss * weights).sum() / weights.sum().clamp(min=1.0)
+
+        return (loss, outputs) if return_outputs else loss
 
 
 def get_gate_module(model):
@@ -203,6 +242,12 @@ def parse_args():
         action="store_true",
         help="Skip loading Stage 1 checkpoint and train EDEF modules from scratch.",
     )
+    parser.add_argument("--entity_loss_weight", type=float, default=2.0,
+                        help="Upweight loss on output (entity) tokens. 1.0 = uniform.")
+    parser.add_argument("--dist_dropout", type=float, default=0.2,
+                        help="Probability of dropping entire distribution vectors during training.")
+    parser.add_argument("--no_refiner", action="store_true",
+                        help="Disable the contextual distribution refiner BiLSTM.")
     return parser.parse_args()
 
 
@@ -242,7 +287,11 @@ def main():
     model = load_phase1_model(args)
 
     hidden_dim = getattr(model.config, "hidden_size", 2560)
-    model = attach_edef_to_model(model, dist_dim=dist_dim, hidden_dim=hidden_dim)
+    model = attach_edef_to_model(
+        model, dist_dim=dist_dim, hidden_dim=hidden_dim,
+        dist_dropout=args.dist_dropout,
+        use_refiner=not args.no_refiner,
+    )
 
     if not args.skip_stage1 and os.path.exists(args.stage1_checkpoint):
         load_edef_checkpoint(model, args.stage1_checkpoint)
@@ -352,6 +401,7 @@ def main():
         callbacks=[
             GateLoggingCallback(model=model, log_every_steps=args.gate_log_steps)
         ],
+        entity_loss_weight=args.entity_loss_weight,
     )
 
     print("Starting Stage 2 EDEF training...")

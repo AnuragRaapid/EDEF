@@ -180,11 +180,14 @@ def test_phase3_distribution_alignment():
 
     # Load distributions
     t0 = time.time()
-    word_entity_dist, default_dist = load_distributions(DIST_PATH)
+    word_entity_dist, default_dist, ngram_dist = load_distributions(DIST_PATH)
     elapsed = time.time() - t0
     report("load_distributions() OK",
            len(word_entity_dist) > 0,
            f"{len(word_entity_dist):,} words loaded in {elapsed:.1f}s")
+    report("ngram_dist loaded",
+           isinstance(ngram_dist, dict),
+           f"{len(ngram_dist):,} n-grams")
 
     report("default_dist is 45-dim",
            len(default_dist) == 45,
@@ -335,7 +338,7 @@ def test_phase5_model_loading():
            f"shape={embed.weight.shape}")
 
     # Attach EDEF
-    model = attach_edef_to_model(model, dist_dim=45, hidden_dim=2560)
+    model = attach_edef_to_model(model, dist_dim=45, hidden_dim=2560, dist_dropout=0.2, use_refiner=True)
     report("attach_edef_to_model() OK",
            hasattr(model, "entity_projector") and hasattr(model, "fusion_gate"))
 
@@ -466,7 +469,7 @@ def test_phase6_training():
         param.requires_grad = False
 
     # Attach EDEF
-    model = attach_edef_to_model(model, dist_dim=45, hidden_dim=2560)
+    model = attach_edef_to_model(model, dist_dim=45, hidden_dim=2560, dist_dropout=0.2, use_refiner=True)
     for param in model.entity_projector.parameters():
         param.requires_grad = True
     for param in model.fusion_gate.parameters():
@@ -614,11 +617,11 @@ def test_phase7_inference():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = attach_edef_to_model(model, dist_dim=45, hidden_dim=2560)
+    model = attach_edef_to_model(model, dist_dim=45, hidden_dim=2560, dist_dropout=0.2, use_refiner=True)
     model.eval()
 
     # Load distributions
-    word_entity_dist, default_dist = load_distributions(DIST_PATH)
+    word_entity_dist, default_dist, _ngram_dist = load_distributions(DIST_PATH)
     report("Distributions loaded for inference", len(word_entity_dist) > 0)
 
     # Build prompt

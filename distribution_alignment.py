@@ -99,15 +99,18 @@ def _to_int(value: object) -> int:
     return 0
 
 
-def load_distributions(dist_path: str) -> tuple[dict[str, list[float]], list[float]]:
+def load_distributions(
+    dist_path: str,
+) -> tuple[dict[str, list[float]], list[float], dict[str, list[float]]]:
     """
-    Load entity distributions from JSON file.
+    Load entity distributions, n-gram distributions, and default dist from JSON files.
 
     Args:
         dist_path: path to entity_distributions.json
 
     Returns:
-        (word_entity_dist, default_dist) tuple
+        (word_entity_dist, default_dist, ngram_dist) tuple.
+        ngram_dist may be empty if the file does not exist.
     """
     with open(dist_path, "r", encoding="utf-8") as f:
         raw = cast(dict[str, object], json.load(f))
@@ -120,6 +123,7 @@ def load_distributions(dist_path: str) -> tuple[dict[str, list[float]], list[flo
     dist_file = Path(dist_path).resolve()
     stats_path = dist_file.with_name("distribution_stats.json")
     index_path = dist_file.with_name("entity_type_index.json")
+    ngram_path = dist_file.with_name("ngram_distributions.json")
 
     default_dist: list[float] | None = None
     if stats_path.exists():
@@ -152,12 +156,51 @@ def load_distributions(dist_path: str) -> tuple[dict[str, list[float]], list[flo
         default_dist = [0.0] * vector_dim
         default_dist[-1] = 1.0
     elif vector_dim and len(default_dist) != vector_dim:
-        # Prefer the metadata file when present, but keep dimensions aligned with the vectors on disk.
         default_dist = default_dist[:vector_dim]
         if len(default_dist) < vector_dim:
             default_dist = default_dist + [0.0] * (vector_dim - len(default_dist))
 
-    return word_entity_dist, default_dist
+    ngram_dist: dict[str, list[float]] = {}
+    if ngram_path.exists():
+        try:
+            with ngram_path.open("r", encoding="utf-8") as f:
+                ngram_raw = cast(dict[str, object], json.load(f))
+            ngram_dist = {
+                str(k).lower(): _to_float_list(cast(list[object], v))
+                for k, v in ngram_raw.items()
+                if isinstance(v, list)
+            }
+        except (json.JSONDecodeError, OSError):
+            ngram_dist = {}
+
+    return word_entity_dist, default_dist, ngram_dist
+
+
+def _ngram_fallback(
+    word: str,
+    ngram_dist: dict[str, list[float]],
+    dist_dim: int,
+    n_range: tuple[int, int] = (3, 5),
+) -> list[float] | None:
+    """Aggregate n-gram distributions for an unknown word."""
+    if not ngram_dist or len(word) < n_range[0]:
+        return None
+    accum = [0.0] * dist_dim
+    count = 0
+    for n in range(n_range[0], n_range[1] + 1):
+        for i in range(len(word) - n + 1):
+            ngram = word[i : i + n]
+            ng_dist = ngram_dist.get(ngram)
+            if ng_dist is not None:
+                for j in range(min(len(ng_dist), dist_dim)):
+                    accum[j] += ng_dist[j]
+                count += 1
+    if count == 0:
+        return None
+    total = sum(accum)
+    if total <= 0:
+        return None
+    return [v / total for v in accum]
 
 
 def get_token_distributions(
@@ -166,21 +209,26 @@ def get_token_distributions(
     word_entity_dist: dict[str, list[float]],
     default_dist: list[float],
     dist_dim: int = 45,
+    ngram_dist: dict[str, list[float]] | None = None,
 ) -> torch.Tensor:
     """
     Given raw text, returns distribution vectors aligned to subword tokens.
 
+    Uses a cascading lookup: word -> hyphen parts -> subword token -> n-gram fallback -> default.
+
     Args:
         text: raw input string
         tokenizer: Qwen3 tokenizer (HuggingFace)
-        word_entity_dist: dict mapping lowercased word -> 45-dim list
-        default_dist: 45-dim list for unknown words [0]*44 + [1.0]
-        dist_dim: dimension of distribution vector (default 45)
+        word_entity_dist: dict mapping lowercased word -> dist_dim-dim list
+        default_dist: dist_dim-dim list for unknown words (global prior)
+        dist_dim: dimension of distribution vector
+        ngram_dist: optional dict mapping character n-grams -> dist_dim-dim list
 
     Returns:
         torch.Tensor of shape (num_tokens, dist_dim)
     """
     safe_default = _ensure_dist_vector(default_dist, dist_dim, [0.0] * dist_dim)
+    _ngram = ngram_dist if ngram_dist is not None else {}
 
     if text == "":
         return torch.empty((0, dist_dim), dtype=torch.float32)
@@ -231,6 +279,8 @@ def get_token_distributions(
                     break
         if dist is None and token_text:
             dist = word_entity_dist.get(token_text)
+        if dist is None:
+            dist = _ngram_fallback(word, _ngram, dist_dim)
 
         aligned_vectors.append(_ensure_dist_vector(dist, dist_dim, safe_default))
 
@@ -247,6 +297,7 @@ def batch_get_distributions(
     default_dist: list[float],
     max_length: int = 4096,
     dist_dim: int = 45,
+    ngram_dist: dict[str, list[float]] | None = None,
 ) -> torch.Tensor:
     """
     Process a batch of texts and return padded distribution tensors.
@@ -267,6 +318,7 @@ def batch_get_distributions(
             word_entity_dist=word_entity_dist,
             default_dist=default_dist,
             dist_dim=dist_dim,
+            ngram_dist=ngram_dist,
         )
         per_text.append(dist[:max_length])
 

@@ -34,6 +34,7 @@ class EDEFDataset(Dataset[dict[str, torch.Tensor]]):
         max_length: int = 4096,
         dist_dim: int | None = None,
         chat_template_fn: Callable[[dict[str, Any]], str] | None = None,
+        ngram_dist: dict[str, list[float]] | None = None,
     ) -> None:
         self.samples = samples
         self.tokenizer = tokenizer
@@ -42,6 +43,7 @@ class EDEFDataset(Dataset[dict[str, torch.Tensor]]):
         self.max_length = max_length
         self.dist_dim = dist_dim if dist_dim is not None else len(default_dist)
         self.chat_template_fn = chat_template_fn
+        self.ngram_dist = ngram_dist
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -139,6 +141,7 @@ class EDEFDataset(Dataset[dict[str, torch.Tensor]]):
             self.word_entity_dist,
             self.default_dist,
             self.dist_dim,
+            ngram_dist=self.ngram_dist,
         )
 
         num_tokens = len(input_ids)
@@ -221,7 +224,7 @@ def build_edef_dataset(
         cache_dir=cache_dir,
         instruction=instruction,
     )
-    word_entity_dist, default_dist = load_distributions(dist_path)
+    word_entity_dist, default_dist, ngram_dist = load_distributions(dist_path)
     effective_dist_dim = len(default_dist) if dist_dim is None else dist_dim
     if effective_dist_dim != len(default_dist):
         raise ValueError(
@@ -236,6 +239,7 @@ def build_edef_dataset(
         max_length=max_length,
         dist_dim=effective_dist_dim,
         chat_template_fn=chat_template_fn,
+        ngram_dist=ngram_dist,
     )
 
 
@@ -323,7 +327,7 @@ def _smoke_test(
         print(f"transformers tokenizer unavailable ({exc}); using mock tokenizer")
 
     if dist_path:
-        word_entity_dist, default_dist = load_distributions(dist_path)
+        word_entity_dist, default_dist, _ngram = load_distributions(dist_path)
         print(f"Loaded distributions from: {dist_path}")
     else:
         word_entity_dist = {

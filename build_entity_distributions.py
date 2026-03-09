@@ -196,13 +196,84 @@ def top_words_for_type(
     ]
 
 
-def build_distributions(word_entity_counts: dict[str, np.ndarray]) -> dict[str, list[float]]:
+def build_distributions(
+    word_entity_counts: dict[str, np.ndarray],
+    smoothing_alpha: float = 0.1,
+) -> dict[str, list[float]]:
     word_entity_dist: dict[str, list[float]] = {}
     for word, counts in word_entity_counts.items():
         total = counts.sum()
         if total > 0:
-            word_entity_dist[word] = (counts / total).tolist()
+            smoothed = counts + smoothing_alpha
+            word_entity_dist[word] = (smoothed / smoothed.sum()).tolist()
     return word_entity_dist
+
+
+def build_ngram_distributions(
+    word_entity_counts: dict[str, np.ndarray],
+    dist_dim: int,
+    n_range: tuple[int, int] = (3, 5),
+    min_ngram_count: float = 5.0,
+    smoothing_alpha: float = 0.1,
+) -> dict[str, list[float]]:
+    """Build character n-gram level distributions from word-level counts.
+
+    For each unique character n-gram (length 3-5) found across the vocabulary,
+    accumulates the entity type counts from all words containing that n-gram.
+    Allows fallback distribution inference for unseen words by aggregating
+    distributions from their constituent character n-grams.
+    """
+    ngram_counts: dict[str, np.ndarray] = defaultdict(
+        lambda: np.zeros(dist_dim, dtype=np.float64)
+    )
+    for word, counts in word_entity_counts.items():
+        if len(word) < n_range[0]:
+            continue
+        for n in range(n_range[0], n_range[1] + 1):
+            for i in range(len(word) - n + 1):
+                ngram = word[i : i + n]
+                if any(ch.isalnum() for ch in ngram):
+                    ngram_counts[ngram] += counts
+
+    ngram_dist: dict[str, list[float]] = {}
+    for ngram, counts in ngram_counts.items():
+        total = counts.sum()
+        if total >= min_ngram_count:
+            smoothed = counts + smoothing_alpha
+            ngram_dist[ngram] = (smoothed / smoothed.sum()).tolist()
+    return ngram_dist
+
+
+def compute_global_prior(
+    word_entity_counts: dict[str, np.ndarray],
+    dist_dim: int,
+    o_idx: int,
+    entity_weight: float = 0.1,
+) -> list[float]:
+    """Compute a global entity type frequency prior for unknown words.
+
+    Instead of hard [0,...,0, 1.0] ("definitely O"), returns a soft prior
+    where entity types get a small probability proportional to their global
+    frequency. This prevents zero-probability entity signals for unseen words.
+    """
+    global_counts = np.zeros(dist_dim, dtype=np.float64)
+    for counts in word_entity_counts.values():
+        global_counts += counts
+
+    entity_total = global_counts.sum() - global_counts[o_idx]
+    if entity_total <= 0:
+        prior = np.zeros(dist_dim)
+        prior[o_idx] = 1.0
+        return prior.tolist()
+
+    entity_freq = global_counts.copy()
+    entity_freq[o_idx] = 0.0
+    if entity_freq.sum() > 0:
+        entity_freq = entity_freq / entity_freq.sum()
+
+    prior = entity_freq * entity_weight
+    prior[o_idx] = 1.0 - entity_weight
+    return prior.tolist()
 
 
 def print_sanity_checks(
@@ -283,7 +354,7 @@ def main() -> None:
         word_entity_counts=word_entity_counts,
     )
 
-    word_entity_dist = build_distributions(word_entity_counts)
+    word_entity_dist = build_distributions(word_entity_counts, smoothing_alpha=0.1)
     words_with_entity_signal = sum(
         1 for probs in word_entity_dist.values() if int(np.argmax(np.asarray(probs))) != o_idx
     )
@@ -292,6 +363,14 @@ def main() -> None:
         (words_with_entity_signal / total_unique_words) * 100.0
         if total_unique_words > 0
         else 0.0
+    )
+
+    ngram_dist = build_ngram_distributions(
+        word_entity_counts, dist_dim=dist_dim, n_range=(3, 5),
+        min_ngram_count=5.0, smoothing_alpha=0.1,
+    )
+    global_prior = compute_global_prior(
+        word_entity_counts, dist_dim=dist_dim, o_idx=o_idx, entity_weight=0.1,
     )
 
     entity_counts = Counter(
@@ -305,7 +384,6 @@ def main() -> None:
         for type_name in entity_types
     }
     prompt_instruction = build_ner_instruction(entity_types)
-    default_dist = [0.0] * len(entity_types) + [1.0]
 
     stats = {
         "data_source": args.data_source,
@@ -316,7 +394,10 @@ def main() -> None:
         "distribution_dim": dist_dim,
         "o_index": o_idx,
         "prompt_instruction": prompt_instruction,
-        "default_unknown_distribution": default_dist,
+        "default_unknown_distribution": global_prior,
+        "global_prior": global_prior,
+        "ngram_count": len(ngram_dist),
+        "smoothing_alpha": 0.1,
         "total_unique_words": total_unique_words,
         "words_with_entity_signal": words_with_entity_signal,
         "vocabulary_coverage": vocabulary_coverage,
@@ -330,6 +411,7 @@ def main() -> None:
     dist_path = args.out_dir / "entity_distributions.json"
     type_idx_path = args.out_dir / "entity_type_index.json"
     stats_path = args.out_dir / "distribution_stats.json"
+    ngram_path = args.out_dir / "ngram_distributions.json"
 
     with dist_path.open("w", encoding="utf-8") as f:
         json.dump(word_entity_dist, f, ensure_ascii=True)
@@ -337,10 +419,13 @@ def main() -> None:
         json.dump(type_to_idx, f, ensure_ascii=True, indent=2)
     with stats_path.open("w", encoding="utf-8") as f:
         json.dump(stats, f, ensure_ascii=True, indent=2)
+    with ngram_path.open("w", encoding="utf-8") as f:
+        json.dump(ngram_dist, f, ensure_ascii=True)
 
     elapsed = time.time() - start_time
     print("\n=== Build Complete ===")
     print(f"Entity distributions written to: {dist_path}")
+    print(f"N-gram distributions written to: {ngram_path} ({len(ngram_dist):,} n-grams)")
     print(f"Entity type index written to: {type_idx_path}")
     print(f"Distribution stats written to: {stats_path}")
     print(f"Total processing time: {elapsed:.2f}s")
@@ -348,6 +433,7 @@ def main() -> None:
     print(f"Tokenized-path samples: {process_summary['tokenized_samples']}")
     print(f"Fallback-path samples: {process_summary['fallback_samples']}")
     print(f"Entity types: {', '.join(entity_types)}")
+    print(f"Global prior (default for unknown words): {[f'{v:.4f}' for v in global_prior[:5]]}...")
 
     print_sanity_checks(word_entity_dist, entity_types, type_to_idx, words_with_entity_signal)
 

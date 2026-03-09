@@ -189,7 +189,7 @@ class EDEFInferencePipeline:
             tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
 
-        word_entity_dist, default_dist = load_distributions(dist_path)
+        word_entity_dist, default_dist, _ngram_dist = load_distributions(dist_path)
 
         model.eval()
         return cls(
