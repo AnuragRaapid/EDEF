@@ -1,24 +1,13 @@
-"""EDEF neural modules: EntityDistProjector and GatedFusion.
+"""Late-correction EDEF modules."""
 
-EntityDistProjector: 2-layer MLP that projects 45-dim entity type distribution
-vectors into the LLM's 2560-dim embedding space (inspired by LLaVA).
-
-GatedFusion: Learned per-token gate that controls how much distribution
-information to inject into each token's embedding (inspired by GEMNET).
-"""
+from __future__ import annotations
 
 import torch
 import torch.nn as nn
 
 
 class EntityDistProjector(nn.Module):
-    """Projects entity distribution vectors (dim=45) into LLM embedding space (dim=2560).
-
-    Architecture inspired by LLaVA's multimodal projector:
-    2-layer MLP with GELU activation.
-
-    Parameters: 45*2560 + 2560 + 2560*2560 + 2560 ≈ 6.67M
-    """
+    """Project 45-d entity distributions into the model hidden space."""
 
     def __init__(self, dist_dim: int = 45, hidden_dim: int = 2560) -> None:
         super().__init__()
@@ -30,31 +19,20 @@ class EntityDistProjector(nn.Module):
         self._init_weights()
 
     def _init_weights(self) -> None:
-        for m in self.projector:
-            if isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, std=0.01)
-                nn.init.zeros_(m.bias)
+        for module in self.projector:
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, std=0.01)
+                nn.init.zeros_(module.bias)
 
     def forward(self, dist_vectors: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            dist_vectors: (batch, seq_len, 45) — entity type distributions per token
-        Returns:
-            (batch, seq_len, 2560) — projected features in LLM embedding space
-        """
         return self.projector(dist_vectors)
 
 
 class GatedFusion(nn.Module):
-    """Gated fusion module inspired by GEMNET (NAACL 2021).
+    """Late gated residual correction.
 
-    Learns per-token gate values that control how much entity distribution
-    information to inject into each token's embedding.
-
-    Formula: h' = h + gate * projected_features
-    where gate = σ(W · [h; projected_features])
-
-    Parameters: (2560+2560)*2560 + 2560 ≈ 13.1M
+    The gate starts near identity so the late correction path can warm up
+    without destabilizing the frozen backbone.
     """
 
     def __init__(self, hidden_dim: int = 2560) -> None:
@@ -64,77 +42,167 @@ class GatedFusion(nn.Module):
 
     def _init_weights(self) -> None:
         nn.init.normal_(self.gate_net.weight, std=0.01)
-        nn.init.constant_(self.gate_net.bias, -2.0)  # sigmoid(-2) ≈ 0.12
+        nn.init.constant_(self.gate_net.bias, -2.0)
 
     def forward(
-        self, token_embeddings: torch.Tensor, projected_features: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Args:
-            token_embeddings: (batch, seq_len, 2560) — from Qwen3 embed_tokens
-            projected_features: (batch, seq_len, 2560) — from EntityDistProjector
-        Returns:
-            (batch, seq_len, 2560) — fused embeddings
-        """
-        combined = torch.cat([token_embeddings, projected_features], dim=-1)
+        self,
+        token_states: torch.Tensor,
+        projected_features: torch.Tensor,
+        prompt_mask: torch.Tensor | None = None,
+        return_gate: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        combined = torch.cat([token_states, projected_features], dim=-1)
         gate = torch.sigmoid(self.gate_net(combined))
-        return token_embeddings + gate * projected_features
+        if prompt_mask is not None:
+            gate = gate * prompt_mask.to(gate.dtype).unsqueeze(-1)
+        fused = token_states + gate * projected_features
+        if return_gate:
+            return fused, gate
+        return fused
+
+
+class _CorrectionBlock(nn.Module):
+    def __init__(self, hidden_dim: int, num_heads: int, mlp_ratio: float = 2.0) -> None:
+        super().__init__()
+        ffn_dim = int(hidden_dim * mlp_ratio)
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.attn = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
+        self.norm2 = nn.LayerNorm(hidden_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, ffn_dim),
+            nn.GELU(),
+            nn.Linear(ffn_dim, hidden_dim),
+        )
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        nn.init.xavier_uniform_(self.attn.in_proj_weight)
+        nn.init.zeros_(self.attn.in_proj_bias)
+        nn.init.normal_(self.attn.out_proj.weight, std=1e-3)
+        nn.init.zeros_(self.attn.out_proj.bias)
+        nn.init.xavier_uniform_(self.mlp[0].weight)
+        nn.init.zeros_(self.mlp[0].bias)
+        nn.init.normal_(self.mlp[2].weight, std=1e-3)
+        nn.init.zeros_(self.mlp[2].bias)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        attn_in = self.norm1(hidden_states)
+        attn_out, _ = self.attn(
+            attn_in,
+            attn_in,
+            attn_in,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+        hidden_states = hidden_states + attn_out
+        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
+        return hidden_states
+
+
+class LateCorrectionTransformer(nn.Module):
+    """Small bottleneck transformer that refines late hidden states."""
+
+    def __init__(
+        self,
+        hidden_dim: int = 2560,
+        bottleneck_dim: int = 512,
+        num_layers: int = 2,
+        num_heads: int = 8,
+        mlp_ratio: float = 2.0,
+    ) -> None:
+        super().__init__()
+        self.input_norm = nn.LayerNorm(hidden_dim)
+        self.down_proj = nn.Linear(hidden_dim, bottleneck_dim)
+        self.layers = nn.ModuleList(
+            _CorrectionBlock(bottleneck_dim, num_heads=num_heads, mlp_ratio=mlp_ratio)
+            for _ in range(num_layers)
+        )
+        self.up_proj = nn.Linear(bottleneck_dim, hidden_dim)
+        self.output_gate = nn.Parameter(torch.full((hidden_dim,), -2.0))
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        nn.init.xavier_uniform_(self.down_proj.weight)
+        nn.init.zeros_(self.down_proj.bias)
+        nn.init.normal_(self.up_proj.weight, std=1e-3)
+        nn.init.zeros_(self.up_proj.bias)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        prompt_mask: torch.Tensor | None = None,
+        return_gate: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if prompt_mask is not None and not prompt_mask.any():
+            if return_gate:
+                gate = torch.sigmoid(self.output_gate).view(1, 1, -1)
+                return hidden_states, gate
+            return hidden_states
+
+        safe_mask = None
+        if prompt_mask is not None:
+            safe_mask = prompt_mask.bool().clone()
+            empty_rows = ~safe_mask.any(dim=1)
+            if empty_rows.any():
+                safe_mask[empty_rows, 0] = True
+
+        hidden = self.down_proj(self.input_norm(hidden_states))
+        key_padding_mask = None if safe_mask is None else ~safe_mask
+        for layer in self.layers:
+            hidden = layer(hidden, key_padding_mask=key_padding_mask)
+
+        delta = self.up_proj(hidden)
+        gate = torch.sigmoid(self.output_gate).view(1, 1, -1)
+        if prompt_mask is not None:
+            delta = delta * prompt_mask.to(delta.dtype).unsqueeze(-1)
+
+        corrected = hidden_states + gate * delta
+        if return_gate:
+            return corrected, gate
+        return corrected
 
 
 if __name__ == "__main__":
-    # Smoke test: verify shapes, init values, gradient flow
-    print("=== EDEF Modules Smoke Test ===\n")
+    print("=== Late Correction EDEF Modules Smoke Test ===\n")
+    torch.manual_seed(7)
 
-    batch, seq_len, dist_dim, hidden_dim = 4, 128, 45, 2560
+    batch, seq_len, dist_dim, hidden_dim = 2, 12, 45, 128
+    projector = EntityDistProjector(dist_dim=dist_dim, hidden_dim=hidden_dim)
+    gate = GatedFusion(hidden_dim=hidden_dim)
+    corrector = LateCorrectionTransformer(
+        hidden_dim=hidden_dim,
+        bottleneck_dim=32,
+        num_layers=2,
+        num_heads=4,
+    )
 
-    projector = EntityDistProjector(dist_dim, hidden_dim)
-    gate = GatedFusion(hidden_dim)
-
-    proj_params = sum(p.numel() for p in projector.parameters())
-    gate_params = sum(p.numel() for p in gate.parameters())
-    print(f"Projector params: {proj_params:,} ({proj_params/1e6:.2f}M)")
-    print(f"Gate params:      {gate_params:,} ({gate_params/1e6:.2f}M)")
-    print(f"Total EDEF params: {(proj_params + gate_params):,} ({(proj_params + gate_params)/1e6:.2f}M)\n")
-
-    # Forward pass
     dist_vectors = torch.randn(batch, seq_len, dist_dim)
-    token_embeds = torch.randn(batch, seq_len, hidden_dim)
+    hidden_states = torch.randn(batch, seq_len, hidden_dim, requires_grad=True)
+    prompt_mask = torch.zeros(batch, seq_len, dtype=torch.bool)
+    prompt_mask[:, :8] = True
 
     projected = projector(dist_vectors)
-    print(f"Projector input:  {dist_vectors.shape}")
-    print(f"Projector output: {projected.shape}")
-    assert projected.shape == (batch, seq_len, hidden_dim), "Projector shape mismatch!"
+    fused, gate_values = gate(hidden_states, projected, prompt_mask=prompt_mask, return_gate=True)
+    corrected, corrector_gate = corrector(fused, prompt_mask=prompt_mask, return_gate=True)
 
-    fused = gate(token_embeds, projected)
-    print(f"Gate input embeds: {token_embeds.shape}")
-    print(f"Gate output:       {fused.shape}")
-    assert fused.shape == (batch, seq_len, hidden_dim), "Gate shape mismatch!"
+    assert projected.shape == (batch, seq_len, hidden_dim)
+    assert fused.shape == hidden_states.shape
+    assert corrected.shape == hidden_states.shape
+    assert gate_values.mean().item() > 0.0
+    assert 0.05 < torch.sigmoid(gate.gate_net.bias).mean().item() < 0.25
+    assert 0.05 < corrector_gate.mean().item() < 0.25
 
-    # Verify initial gate values near 0.12
-    with torch.no_grad():
-        combined = torch.cat([token_embeds, projected], dim=-1)
-        gate_vals = torch.sigmoid(gate.gate_net(combined))
-        print(f"\nInitial gate stats: mean={gate_vals.mean():.4f}, "
-              f"std={gate_vals.std():.4f}, min={gate_vals.min():.4f}, max={gate_vals.max():.4f}")
-        assert 0.05 < gate_vals.mean().item() < 0.25, f"Gate mean {gate_vals.mean():.4f} not near 0.12!"
-
-    # Verify gradient flow
-    loss = fused.sum()
+    loss = corrected.square().mean()
     loss.backward()
-    proj_has_grad = all(p.grad is not None and p.grad.abs().sum() > 0 for p in projector.parameters())
-    gate_has_grad = all(p.grad is not None and p.grad.abs().sum() > 0 for p in gate.parameters())
-    print(f"\nProjector gradients flow: {proj_has_grad}")
-    print(f"Gate gradients flow:      {gate_has_grad}")
-    assert proj_has_grad, "No gradients in projector!"
-    assert gate_has_grad, "No gradients in gate!"
-
-    # Verify near-identity at init (fused ≈ token_embeds)
-    projector.zero_grad()
-    gate.zero_grad()
-    with torch.no_grad():
-        diff = (fused - token_embeds).abs().mean()
-        rel_diff = diff / token_embeds.abs().mean()
-        print(f"\nFusion contribution (abs mean diff): {diff:.6f}")
-        print(f"Relative contribution: {rel_diff:.6f} (should be small)")
-
-    print("\n✓ All smoke tests passed!")
+    grad_checks = {
+        "projector": all(p.grad is not None and p.grad.abs().sum() > 0 for p in projector.parameters()),
+        "gate": all(p.grad is not None and p.grad.abs().sum() > 0 for p in gate.parameters()),
+        "corrector": all(p.grad is not None and p.grad.abs().sum() > 0 for p in corrector.parameters()),
+    }
+    print("Gradient flow:", grad_checks)
+    assert all(grad_checks.values())
+    print("\n✓ Late correction module smoke tests passed!")

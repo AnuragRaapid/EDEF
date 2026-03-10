@@ -1,5 +1,7 @@
 # pyright: reportMissingImports=false, reportUnknownParameterType=false, reportUnknownVariableType=false, reportUnknownMemberType=false, reportAny=false, reportExplicitAny=false, reportUnusedImport=false, reportUnusedCallResult=false, reportPrivateImportUsage=false, reportImplicitRelativeImport=false, reportUnannotatedClassAttribute=false, reportMissingParameterType=false, reportUnknownArgumentType=false
 
+from __future__ import annotations
+
 import argparse
 import importlib
 import json
@@ -20,7 +22,10 @@ else:
 get_token_distributions = _dist_mod.get_token_distributions
 load_distributions = _dist_mod.load_distributions
 attach_edef_to_model = _edef_mod.attach_edef_to_model
+edef_runtime_context = _edef_mod.edef_runtime_context
+get_edef_host = _edef_mod.get_edef_host
 load_edef_checkpoint = _edef_mod.load_edef_checkpoint
+load_edef_config = _edef_mod.load_edef_config
 
 
 NER_INSTRUCTION = (
@@ -30,14 +35,11 @@ NER_INSTRUCTION = (
 )
 
 
-def parse_ner_output(text):
-    """Parse model output to extract NER entities."""
-    import json
+def parse_ner_output(text: str) -> dict[str, Any]:
     import re
 
     try:
-        data = json.loads(text.strip())
-        return data
+        return json.loads(text.strip())
     except json.JSONDecodeError:
         pass
 
@@ -48,20 +50,6 @@ def parse_ner_output(text):
         except json.JSONDecodeError:
             pass
     return {"ner": []}
-
-
-def _find_edef_host(model: Any) -> Any:
-    if hasattr(model, "entity_projector") and hasattr(model, "fusion_gate"):
-        return model
-    if hasattr(model, "base_model"):
-        found = _find_edef_host(model.base_model)
-        if found is not None:
-            return found
-    if hasattr(model, "model"):
-        found = _find_edef_host(model.model)
-        if found is not None:
-            return found
-    return None
 
 
 def _build_chat_prompt(tokenizer: Any, text: str) -> str:
@@ -94,19 +82,29 @@ def _resolve_torch_dtype(dtype_name: str) -> torch.dtype | str:
     raise ValueError(f"Unsupported torch dtype: {dtype_name}")
 
 
+def _build_prompt_features(
+    prompt_text: str,
+    tokenizer: Any,
+    word_entity_dist: dict[str, list[float]],
+    default_dist: list[float],
+    dist_dim: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    encoding = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)
+    input_ids = encoding["input_ids"].to(device)
+    attention_mask = encoding["attention_mask"].to(device)
+    dist_vectors = get_token_distributions(
+        text=prompt_text,
+        tokenizer=tokenizer,
+        word_entity_dist=word_entity_dist,
+        default_dist=default_dist,
+        dist_dim=dist_dim,
+    ).unsqueeze(0).to(device=device, dtype=torch.float32)
+    prompt_mask = torch.ones((1, dist_vectors.shape[1]), dtype=torch.bool, device=device)
+    return input_ids, attention_mask, dist_vectors, prompt_mask
+
+
 class EDEFInferencePipeline:
-    """EDEF-enhanced NER inference pipeline.
-
-    Usage:
-        pipeline = EDEFInferencePipeline.from_pretrained(
-            model_path="saves/edef-stage2",
-            phase1_model="saves/phase1_merged",
-            dist_path="entity_distributions.json",
-        )
-        result = pipeline.predict("Patient has chest pain and takes 500 mg aspirin.")
-        # Returns: {"ner": [["chest pain", "Sign_Symptom"], ["500 mg", "Dose_Med"], ["aspirin", "Drug"]]}
-    """
-
     def __init__(
         self,
         model: Any,
@@ -114,18 +112,13 @@ class EDEFInferencePipeline:
         word_entity_dist: dict[str, list[float]],
         default_dist: list[float],
         dist_dim: int = 45,
-    ):
+    ) -> None:
         self.model = model
         self.tokenizer = tokenizer
         self.word_entity_dist = word_entity_dist
         self.default_dist = default_dist
         self.dist_dim = dist_dim
-
-        host = _find_edef_host(model)
-        if host is None:
-            raise ValueError("Could not locate attached EDEF modules in model.")
-        self._edef_host = host
-
+        self._edef_host = get_edef_host(model)
         self.device = next(self.model.parameters()).device
 
     @classmethod
@@ -137,12 +130,15 @@ class EDEFInferencePipeline:
         base_model: str = "Qwen/Qwen3-4B-Instruct",
         dist_dim: int = 45,
         hidden_dim: int | None = None,
+        insertion_layer: int | None = None,
+        corrector_layers: int = 2,
+        corrector_dim: int = 512,
+        corrector_heads: int = 8,
         device_map: str = "auto",
         torch_dtype: str = "auto",
         trust_remote_code: bool = True,
-    ):
+    ) -> "EDEFInferencePipeline":
         dtype = _resolve_torch_dtype(torch_dtype)
-
         model_source = phase1_model if phase1_model else base_model
         model = AutoModelForCausalLM.from_pretrained(
             model_source,
@@ -151,92 +147,79 @@ class EDEFInferencePipeline:
             trust_remote_code=trust_remote_code,
         )
 
-        hidden = hidden_dim if hidden_dim is not None else getattr(model.config, "hidden_size", 2560)
-        model = attach_edef_to_model(model, dist_dim=dist_dim, hidden_dim=hidden)
-        model = PeftModel.from_pretrained(model, model_path)
-
         edef_ckpt = os.path.join(model_path, "edef_checkpoint")
+        saved_cfg = load_edef_config(edef_ckpt) if os.path.isdir(edef_ckpt) else {}
+        hidden = hidden_dim if hidden_dim is not None else int(getattr(model.config, "hidden_size", 2560))
+        model = attach_edef_to_model(
+            model,
+            dist_dim=int(saved_cfg.get("dist_dim", dist_dim)),
+            hidden_dim=hidden,
+            insertion_layer=int(saved_cfg.get("insertion_layer", insertion_layer if insertion_layer is not None else 28)),
+            corrector_layers=int(saved_cfg.get("corrector_layers", corrector_layers)),
+            corrector_dim=int(saved_cfg.get("corrector_dim", corrector_dim)),
+            corrector_heads=int(saved_cfg.get("corrector_heads", corrector_heads)),
+            edef_dtype=torch.float32,
+        )
+        model = PeftModel.from_pretrained(model, model_path)
         if os.path.isdir(edef_ckpt):
-            host = _find_edef_host(model)
-            if host is None:
-                raise RuntimeError("EDEF modules are not attached after loading LoRA adapter.")
-            load_edef_checkpoint(host, edef_ckpt)
+            load_edef_checkpoint(model, edef_ckpt)
 
-        tokenizer_source = model_path if os.path.exists(os.path.join(model_path, "tokenizer_config.json")) else model_source
+        tokenizer_source = (
+            model_path if os.path.exists(os.path.join(model_path, "tokenizer_config.json")) else model_source
+        )
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, trust_remote_code=trust_remote_code)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
 
         word_entity_dist, default_dist = load_distributions(dist_path)
-
         model.eval()
         return cls(model, tokenizer, word_entity_dist, default_dist, dist_dim=dist_dim)
 
-    def _build_fused_embeddings(self, prompt_text: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        encoding = self.tokenizer(
-            prompt_text,
-            return_tensors="pt",
-            add_special_tokens=False,
-        )
-        input_ids = encoding["input_ids"].to(self.device)
-        attention_mask = encoding["attention_mask"].to(self.device)
-
-        token_embed_layer = self.model.get_input_embeddings()
-        token_embeds = token_embed_layer(input_ids)
-
-        dist_vectors = get_token_distributions(
-            text=prompt_text,
-            tokenizer=self.tokenizer,
-            word_entity_dist=self.word_entity_dist,
-            default_dist=self.default_dist,
-            dist_dim=self.dist_dim,
-        )
-        dist_vectors = dist_vectors.to(device=token_embeds.device, dtype=token_embeds.dtype)
-        dist_vectors = dist_vectors.unsqueeze(0)
-
-        seq_len = token_embeds.shape[1]
-        if dist_vectors.shape[1] > seq_len:
-            dist_vectors = dist_vectors[:, :seq_len, :]
-        elif dist_vectors.shape[1] < seq_len:
-            pad_rows = seq_len - dist_vectors.shape[1]
-            padding = torch.zeros(
-                (1, pad_rows, self.dist_dim),
-                device=token_embeds.device,
-                dtype=token_embeds.dtype,
-            )
-            dist_vectors = torch.cat([dist_vectors, padding], dim=1)
-
-        projected = self._edef_host.entity_projector(dist_vectors)
-        fused_embeds = self._edef_host.fusion_gate(token_embeds, projected)
-        return input_ids, attention_mask, fused_embeds
-
-    def predict(self, text: str, max_new_tokens: int = 2048, temperature: float = 0.0):
+    def predict(self, text: str, max_new_tokens: int = 2048, temperature: float = 0.0) -> dict[str, Any]:
         prompt_text = _build_chat_prompt(self.tokenizer, text)
+        input_ids, attention_mask, dist_vectors, prompt_mask = _build_prompt_features(
+            prompt_text,
+            self.tokenizer,
+            self.word_entity_dist,
+            self.default_dist,
+            self.dist_dim,
+            self.device,
+        )
 
-        with torch.no_grad():
-            input_ids, attention_mask, fused_embeds = self._build_fused_embeddings(prompt_text)
+        do_sample = temperature > 0
+        generate_kwargs: dict[str, Any] = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "max_new_tokens": max_new_tokens,
+            "do_sample": do_sample,
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "eos_token_id": self.tokenizer.eos_token_id,
+            "use_cache": True,
+        }
+        if do_sample:
+            generate_kwargs["temperature"] = temperature
 
-            do_sample = temperature > 0
-            generate_kwargs: dict[str, Any] = {
-                "inputs_embeds": fused_embeds,
-                "attention_mask": attention_mask,
-                "max_new_tokens": max_new_tokens,
-                "do_sample": do_sample,
-                "pad_token_id": self.tokenizer.pad_token_id,
-                "eos_token_id": self.tokenizer.eos_token_id,
-            }
-            if do_sample:
-                generate_kwargs["temperature"] = temperature
-
-            output_ids = self.model.generate(**generate_kwargs)
+        with torch.inference_mode():
+            with edef_runtime_context(
+                self.model,
+                entity_dist_vectors=dist_vectors,
+                entity_prompt_mask=prompt_mask,
+                prefill_only=True,
+            ):
+                output_ids = self.model.generate(**generate_kwargs)
 
         prompt_len = input_ids.shape[1]
         completion_ids = output_ids[0, prompt_len:]
         decoded = self.tokenizer.decode(completion_ids, skip_special_tokens=True)
         return parse_ner_output(decoded)
 
-    def predict_batch(self, texts, max_new_tokens: int = 2048, temperature: float = 0.0):
+    def predict_batch(
+        self,
+        texts: list[str],
+        max_new_tokens: int = 2048,
+        temperature: float = 0.0,
+    ) -> list[dict[str, Any]]:
         return [self.predict(text, max_new_tokens=max_new_tokens, temperature=temperature) for text in texts]
 
 
@@ -259,8 +242,8 @@ def _load_texts_from_json(input_file: str) -> list[str]:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="EDEF-enhanced clinical NER inference")
-    parser.add_argument("--model_path", required=True, help="Stage 2 model path (LoRA + EDEF)")
+    parser = argparse.ArgumentParser(description="Late-correction EDEF clinical NER inference")
+    parser.add_argument("--model_path", required=True, help="Stage 2 model path (LoRA + late EDEF)")
     parser.add_argument("--phase1_model", required=True, help="Phase 1 merged model path")
     parser.add_argument("--base_model", default="Qwen/Qwen3-4B-Instruct", help="Base model name")
     parser.add_argument("--dist_path", required=True, help="Entity distributions JSON")
@@ -280,7 +263,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_arg_parser().parse_args()
-
     pipeline = EDEFInferencePipeline.from_pretrained(
         model_path=args.model_path,
         phase1_model=args.phase1_model,
@@ -292,12 +274,11 @@ def main() -> None:
     )
 
     if args.input is not None:
-        prediction = pipeline.predict(
+        output_payload: Any = pipeline.predict(
             args.input,
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
         )
-        output_payload: Any = prediction
     else:
         texts = _load_texts_from_json(args.input_file)
         predictions = pipeline.predict_batch(
@@ -305,10 +286,7 @@ def main() -> None:
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
         )
-        output_payload = [
-            {"input": text, "prediction": pred}
-            for text, pred in zip(texts, predictions)
-        ]
+        output_payload = [{"input": text, "prediction": pred} for text, pred in zip(texts, predictions)]
 
     output_text = json.dumps(output_payload, ensure_ascii=False, indent=2)
     if args.output_file:

@@ -32,7 +32,10 @@ else:
 get_token_distributions = _dist_mod.get_token_distributions
 load_distributions = _dist_mod.load_distributions
 attach_edef_to_model = _edef_mod.attach_edef_to_model
+edef_runtime_context = _edef_mod.edef_runtime_context
+get_last_edef_stats = _edef_mod.get_last_edef_stats
 load_edef_checkpoint = _edef_mod.load_edef_checkpoint
+load_edef_config = _edef_mod.load_edef_config
 
 
 NER_INSTRUCTION = (
@@ -114,41 +117,6 @@ def _model_device(model: Any) -> torch.device:
         return torch.device("cpu")
 
 
-def _resolve_embed_layer(model: Any) -> torch.nn.Module:
-    candidates = [
-        getattr(getattr(model, "model", None), "embed_tokens", None),
-        getattr(getattr(getattr(model, "base_model", None), "model", None), "embed_tokens", None),
-        getattr(
-            getattr(getattr(getattr(model, "base_model", None), "model", None), "model", None),
-            "embed_tokens",
-            None,
-        ),
-    ]
-    for layer in candidates:
-        if isinstance(layer, torch.nn.Module):
-            return layer
-    raise AttributeError("Could not locate embed_tokens layer on model")
-
-
-def _resolve_edef_modules(model: Any) -> tuple[torch.nn.Module, torch.nn.Module]:
-    projector_candidates = [
-        getattr(model, "entity_projector", None),
-        getattr(getattr(model, "base_model", None), "entity_projector", None),
-        getattr(getattr(getattr(model, "base_model", None), "model", None), "entity_projector", None),
-    ]
-    gate_candidates = [
-        getattr(model, "fusion_gate", None),
-        getattr(getattr(model, "base_model", None), "fusion_gate", None),
-        getattr(getattr(getattr(model, "base_model", None), "model", None), "fusion_gate", None),
-    ]
-
-    projector = next((m for m in projector_candidates if isinstance(m, torch.nn.Module)), None)
-    gate = next((m for m in gate_candidates if isinstance(m, torch.nn.Module)), None)
-    if projector is None or gate is None:
-        raise AttributeError("Could not resolve entity_projector/fusion_gate on model")
-    return projector, gate
-
-
 def load_edef_model(args: argparse.Namespace) -> tuple[Any, Any]:
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
     model = AutoModelForCausalLM.from_pretrained(
@@ -160,12 +128,22 @@ def load_edef_model(args: argparse.Namespace) -> tuple[Any, Any]:
     )
 
     hidden_dim = int(getattr(model.config, "hidden_size", 2560))
-    model = attach_edef_to_model(model, dist_dim=args.dist_dim, hidden_dim=hidden_dim)
+    edef_ckpt = os.path.join(args.model_path, "edef_checkpoint")
+    saved_cfg = load_edef_config(edef_ckpt) if os.path.isdir(edef_ckpt) else {}
+    model = attach_edef_to_model(
+        model,
+        dist_dim=int(saved_cfg.get("dist_dim", args.dist_dim)),
+        hidden_dim=hidden_dim,
+        insertion_layer=int(saved_cfg.get("insertion_layer", 28)),
+        corrector_layers=int(saved_cfg.get("corrector_layers", 2)),
+        corrector_dim=int(saved_cfg.get("corrector_dim", 512)),
+        corrector_heads=int(saved_cfg.get("corrector_heads", 8)),
+        edef_dtype=torch.float32,
+    )
     model = PeftModel.from_pretrained(model, args.model_path)
 
-    edef_ckpt = os.path.join(args.model_path, "edef_checkpoint")
     if os.path.exists(edef_ckpt):
-        load_edef_checkpoint(model.base_model.model, edef_ckpt)
+        load_edef_checkpoint(model, edef_ckpt)
     else:
         print(f"[WARN] EDEF checkpoint not found at: {edef_ckpt}")
 
@@ -187,125 +165,25 @@ def _build_prompt(tokenizer: Any, clinical_text: str) -> str:
     return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
 
-def _prepare_fused_embeddings(
-    model: Any,
-    input_ids: torch.Tensor,
-    dist_vectors: torch.Tensor,
-    force_gate_zero: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    embed_layer = _resolve_embed_layer(model)
-    projector, gate_module = _resolve_edef_modules(model)
-
-    inputs_embeds = embed_layer(input_ids)
-    seq_len = inputs_embeds.shape[1]
-
-    if dist_vectors.shape[1] > seq_len:
-        dist_vectors = dist_vectors[:, :seq_len, :]
-    elif dist_vectors.shape[1] < seq_len:
-        pad = torch.zeros(
-            dist_vectors.shape[0],
-            seq_len - dist_vectors.shape[1],
-            dist_vectors.shape[2],
-            device=inputs_embeds.device,
-            dtype=inputs_embeds.dtype,
-        )
-        dist_vectors = torch.cat([dist_vectors.to(inputs_embeds.dtype), pad], dim=1)
-    else:
-        dist_vectors = dist_vectors.to(inputs_embeds.dtype)
-
-    projected = projector(dist_vectors)
-    combined = torch.cat([inputs_embeds, projected], dim=-1)
-    gate_net = getattr(gate_module, "gate_net", None)
-    if not isinstance(gate_net, torch.nn.Module):
-        raise AttributeError("fusion_gate must expose gate_net linear layer")
-    gate_vals = torch.sigmoid(gate_net(combined))
-    if force_gate_zero:
-        gate_vals = torch.zeros_like(gate_vals)
-    fused = inputs_embeds + gate_vals * projected
-    token_gate = gate_vals.mean(dim=-1)
-    return fused, token_gate, dist_vectors
-
-
-class _EdefEmbedHook:
-    """Forward hook on embed_tokens that applies EDEF fusion during the prefill step.
-
-    By hooking the embedding layer instead of passing inputs_embeds to generate(),
-    we let generate() work with normal input_ids, avoiding output-format ambiguity.
-    The hook only fires for the prefill (full-sequence) call; subsequent single-token
-    autoregressive steps pass through unmodified.
-
-    The fusion math matches training exactly (see edef_model.attach_edef_to_model):
-        E = embed_tokens(input_ids)          # intercepted by this hook as `output`
-        D = align(dist_vectors, seq_len)
-        P = projector(D)
-        F = fusion_gate(E, P)                # calls GatedFusion.forward
-          = E + sigmoid(gate_net(cat[E,P])) * P
-    """
-
-    def __init__(
-        self,
-        projector: torch.nn.Module,
-        gate_module: torch.nn.Module,
-        dist_vectors: torch.Tensor,
-        force_gate_zero: bool,
-    ) -> None:
-        self.projector = projector
-        self.gate_module = gate_module
-        self.dist_vectors = dist_vectors
-        self.force_gate_zero = force_gate_zero
-        self._prefill_done = False
-
-    def _align_dist(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        dv = self.dist_vectors
-        if dv.shape[1] > seq_len:
-            dv = dv[:, :seq_len, :]
-        elif dv.shape[1] < seq_len:
-            pad = torch.zeros(
-                dv.shape[0], seq_len - dv.shape[1], dv.shape[2],
-                device=device, dtype=dtype,
-            )
-            dv = torch.cat([dv.to(dtype), pad], dim=1)
-        else:
-            dv = dv.to(dtype)
-        return dv
-
-    def __call__(
-        self,
-        module: torch.nn.Module,
-        inputs: Any,
-        output: torch.Tensor,
-    ) -> torch.Tensor:
-        if self._prefill_done:
-            return output
-        if output.shape[1] <= 1:
-            return output
-        self._prefill_done = True
-
-        dv = self._align_dist(output.shape[1], output.device, output.dtype)
-
-        # Match training: projector(D) then fusion_gate(E, P)
-        projected = self.projector(dv)
-
-        if self.force_gate_zero:
-            # Ablation: skip fusion entirely (gate=0 → fused = E)
-            self._token_gate = torch.zeros(output.shape[0], output.shape[1])
-            self._aligned_dist = dv.detach().cpu()
-            return output
-
-        # Call fusion_gate.forward(E, P) — identical to training path
-        fused = self.gate_module(output, projected)
-
-        # Capture gate stats for analysis (recompute gate_vals without gradient)
-        with torch.no_grad():
-            combined = torch.cat([output, projected], dim=-1)
-            gate_net = getattr(self.gate_module, "gate_net", None)
-            if gate_net is None:
-                gate_net = self.gate_module.gate_net
-            gate_vals = torch.sigmoid(gate_net(combined))
-            self._token_gate = gate_vals.mean(dim=-1).detach().cpu()
-        self._aligned_dist = dv.detach().cpu()
-
-        return fused
+def _build_prompt_features(
+    prompt: str,
+    tokenizer: Any,
+    word_entity_dist: dict[str, list[float]],
+    default_dist: list[float],
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    encoding = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
+    input_ids = encoding.input_ids.to(device)
+    attention_mask = encoding.attention_mask.to(device)
+    dist_vectors = get_token_distributions(
+        prompt,
+        tokenizer,
+        word_entity_dist,
+        default_dist,
+        dist_dim=len(default_dist),
+    ).unsqueeze(0).to(device=device, dtype=torch.float32)
+    prompt_mask = torch.ones((1, dist_vectors.shape[1]), dtype=torch.bool, device=device)
+    return input_ids, attention_mask, dist_vectors, prompt_mask
 
 
 def _generate_with_mode(
@@ -319,42 +197,40 @@ def _generate_with_mode(
 ) -> tuple[str, torch.Tensor, torch.Tensor]:
     prompt = _build_prompt(tokenizer, clinical_text)
     device = _model_device(model)
-    encoding = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
-    input_ids = encoding.input_ids.to(device)
-    attention_mask = encoding.attention_mask.to(device)
-
-    dist_vectors = get_token_distributions(
+    input_ids, attention_mask, dist_vectors, prompt_mask = _build_prompt_features(
         prompt,
         tokenizer,
         word_entity_dist,
         default_dist,
-        dist_dim=len(default_dist),
-    ).unsqueeze(0).to(device)
-
-    embed_layer = _resolve_embed_layer(model)
-    projector, gate_module = _resolve_edef_modules(model)
-    hook = _EdefEmbedHook(projector, gate_module, dist_vectors, force_gate_zero)
-    handle = embed_layer.register_forward_hook(hook)
+        device,
+    )
 
     with torch.inference_mode():
-        outputs = model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            use_cache=True,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-        )
-    handle.remove()
+        with edef_runtime_context(
+            model,
+            entity_dist_vectors=dist_vectors,
+            entity_prompt_mask=prompt_mask,
+            ablate=force_gate_zero,
+            prefill_only=True,
+        ):
+            outputs = model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                use_cache=True,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+            )
 
     seq = outputs[0]
     input_len = input_ids.shape[1]
     new_tokens = seq[input_len:]
     generated = tokenizer.decode(new_tokens, skip_special_tokens=True)
 
-    token_gate = getattr(hook, "_token_gate", torch.zeros(1, input_len))
-    aligned_dist = getattr(hook, "_aligned_dist", dist_vectors.cpu())
+    stats = get_last_edef_stats(model)
+    token_gate = stats["token_gate"] if stats["token_gate"] is not None else torch.zeros(1, input_len)
+    aligned_dist = stats["aligned_dist"] if stats["aligned_dist"] is not None else dist_vectors.cpu()
     return generated.strip(), token_gate, aligned_dist
 
 
@@ -406,12 +282,6 @@ def _generate_batch_with_mode(
     max_new_tokens: int,
     force_gate_zero: bool,
 ) -> tuple[list[str], list[torch.Tensor], list[torch.Tensor]]:
-    """Batched generation with left-padding and embedding-hook EDEF fusion.
-
-    Uses a forward hook on embed_tokens to inject EDEF fusion during the
-    prefill step, then calls generate(input_ids=...) so that the output
-    format is always [input_ids | generated_ids] with reliable slicing.
-    """
     if not batch_texts:
         return [], [], []
 
@@ -433,6 +303,7 @@ def _generate_batch_with_mode(
     dist_dim = len(default_dist)
 
     dist_vectors = torch.zeros(bsz, max_len, dist_dim, device=device, dtype=torch.float32)
+    prompt_mask = torch.zeros(bsz, max_len, device=device, dtype=torch.bool)
     for idx, prompt in enumerate(prompts):
         dist = get_token_distributions(
             prompt, tokenizer, word_entity_dist, default_dist, dist_dim=dist_dim,
@@ -441,27 +312,29 @@ def _generate_batch_with_mode(
         actual_len = min(dist.shape[0], prompt_len)
         start_pos = max_len - prompt_len
         dist_vectors[idx, start_pos : start_pos + actual_len, :] = dist[:actual_len]
-
-    embed_layer = _resolve_embed_layer(model)
-    projector, gate_module = _resolve_edef_modules(model)
-    hook = _EdefEmbedHook(projector, gate_module, dist_vectors, force_gate_zero)
-    handle = embed_layer.register_forward_hook(hook)
+        prompt_mask[idx, start_pos : start_pos + actual_len] = True
 
     with torch.inference_mode():
-        outputs = model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            use_cache=True,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-        )
-    handle.remove()
+        with edef_runtime_context(
+            model,
+            entity_dist_vectors=dist_vectors,
+            entity_prompt_mask=prompt_mask,
+            ablate=force_gate_zero,
+            prefill_only=True,
+        ):
+            outputs = model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                use_cache=True,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+            )
 
-    # Compute gate stats from the hook's captured values
-    token_gate = getattr(hook, "_token_gate", torch.zeros(bsz, max_len))
-    aligned_dist = getattr(hook, "_aligned_dist", dist_vectors.cpu())
+    stats = get_last_edef_stats(model)
+    token_gate = stats["token_gate"] if stats["token_gate"] is not None else torch.zeros(bsz, max_len)
+    aligned_dist = stats["aligned_dist"] if stats["aligned_dist"] is not None else dist_vectors.cpu()
 
     generated_texts: list[str] = []
     per_sample_gates: list[torch.Tensor] = []
@@ -775,18 +648,18 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate EDEF-enhanced NER model")
-    parser.add_argument("--model_path", type=str, default="saves/edef-stage2")
+    parser.add_argument("--model_path", type=str, default="saves/late-edef-stage2")
     parser.add_argument("--base_model", type=str, default="unsloth/Qwen3-4B-Instruct-2507")
-    parser.add_argument("--phase1_model", type=str, default="/workspace/Soft Prompt Tuning/qwen3-phase1-checkpoint")
+    parser.add_argument("--phase1_model", type=str, default="./qwen3-phase1-checkpoint")
     parser.add_argument(
         "--test_data",
         type=str,
-        default="/workspace/Soft Prompt Tuning/data/test_ner_filtered.json",
+        default="/home/anurag/NER/Multi-task Finetuning/Multitask Finetuning Phase 2 Dataset/test_ner_filtered.json",
     )
     parser.add_argument(
         "--dist_path",
         type=str,
-        default="/workspace/Soft Prompt Tuning/entity_distributions.json",
+        default="./entity_distributions.json",
     )
     parser.add_argument("--output_dir", type=str, default="evaluation_results")
     parser.add_argument("--max_new_tokens", type=int, default=2048)

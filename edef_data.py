@@ -72,11 +72,11 @@ class EDEFDataset(Dataset[dict[str, torch.Tensor]]):
         ]
         return self._apply_chat_template(messages)
 
-    def _build_labels(
+    def _build_labels_and_prompt_len(
         self,
         sample: dict[str, Any],
         input_ids: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, int, str]:
         labels = input_ids.clone()
 
         prompt_text = self._format_sample(sample, include_output=False)
@@ -107,7 +107,7 @@ class EDEFDataset(Dataset[dict[str, torch.Tensor]]):
             if output_len > 0:
                 labels[-output_len:] = input_ids[-output_len:]
 
-        return labels
+        return labels, prompt_len, prompt_text
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         sample = self.samples[idx]
@@ -124,10 +124,10 @@ class EDEFDataset(Dataset[dict[str, torch.Tensor]]):
 
         input_ids = encoding["input_ids"].squeeze(0)
         attention_mask = encoding["attention_mask"].squeeze(0)
-        labels = self._build_labels(sample, input_ids)
+        labels, prompt_len, prompt_text = self._build_labels_and_prompt_len(sample, input_ids)
 
-        dist_vectors = get_token_distributions(
-            text,
+        prompt_dists = get_token_distributions(
+            prompt_text,
             self.tokenizer,
             self.word_entity_dist,
             self.default_dist,
@@ -135,18 +135,28 @@ class EDEFDataset(Dataset[dict[str, torch.Tensor]]):
         )
 
         num_tokens = len(input_ids)
-        if len(dist_vectors) > num_tokens:
-            dist_vectors = dist_vectors[:num_tokens]
-        elif len(dist_vectors) < num_tokens:
-            pad_rows = num_tokens - len(dist_vectors)
-            padding = torch.zeros(pad_rows, self.dist_dim, dtype=dist_vectors.dtype)
-            dist_vectors = torch.cat([dist_vectors, padding], dim=0)
+        prompt_len = min(prompt_len, num_tokens)
+        if len(prompt_dists) > prompt_len:
+            prompt_dists = prompt_dists[:prompt_len]
+        elif len(prompt_dists) < prompt_len:
+            pad_rows = prompt_len - len(prompt_dists)
+            padding = torch.zeros(pad_rows, self.dist_dim, dtype=prompt_dists.dtype)
+            prompt_dists = torch.cat([prompt_dists, padding], dim=0)
+
+        dist_vectors = torch.zeros(num_tokens, self.dist_dim, dtype=prompt_dists.dtype)
+        if prompt_len > 0:
+            dist_vectors[:prompt_len] = prompt_dists[:prompt_len]
+
+        prompt_mask = torch.zeros(num_tokens, dtype=torch.bool)
+        if prompt_len > 0:
+            prompt_mask[:prompt_len] = True
 
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
             "entity_dist_vectors": dist_vectors,
+            "entity_prompt_mask": prompt_mask,
         }
 
 
@@ -161,6 +171,7 @@ class EDEFDataCollator:
         attention_mask = [f["attention_mask"] for f in features]
         labels = [f["labels"] for f in features]
         dist_vectors = [f["entity_dist_vectors"] for f in features]
+        prompt_masks = [f["entity_prompt_mask"] for f in features]
 
         max_len = min(max(len(ids) for ids in input_ids), self.max_length)
 
@@ -168,30 +179,41 @@ class EDEFDataCollator:
         padded_attention: list[torch.Tensor] = []
         padded_labels: list[torch.Tensor] = []
         padded_dists: list[torch.Tensor] = []
+        padded_prompt_masks: list[torch.Tensor] = []
 
-        for ids, mask, labs, dists in zip(input_ids, attention_mask, labels, dist_vectors):
+        for ids, mask, labs, dists, prompt_mask in zip(
+            input_ids,
+            attention_mask,
+            labels,
+            dist_vectors,
+            prompt_masks,
+        ):
             pad_len = max_len - len(ids)
             if pad_len > 0:
                 padded_input_ids.append(F.pad(ids, (0, pad_len), value=self.pad_token_id))
                 padded_attention.append(F.pad(mask, (0, pad_len), value=0))
                 padded_labels.append(F.pad(labs, (0, pad_len), value=-100))
                 padded_dists.append(F.pad(dists, (0, 0, 0, pad_len), value=0.0))
+                padded_prompt_masks.append(F.pad(prompt_mask, (0, pad_len), value=False))
             elif pad_len < 0:
                 padded_input_ids.append(ids[:max_len])
                 padded_attention.append(mask[:max_len])
                 padded_labels.append(labs[:max_len])
                 padded_dists.append(dists[:max_len])
+                padded_prompt_masks.append(prompt_mask[:max_len])
             else:
                 padded_input_ids.append(ids)
                 padded_attention.append(mask)
                 padded_labels.append(labs)
                 padded_dists.append(dists)
+                padded_prompt_masks.append(prompt_mask)
 
         return {
             "input_ids": torch.stack(padded_input_ids),
             "attention_mask": torch.stack(padded_attention),
             "labels": torch.stack(padded_labels),
             "entity_dist_vectors": torch.stack(padded_dists),
+            "entity_prompt_mask": torch.stack(padded_prompt_masks),
         }
 
 
@@ -329,9 +351,14 @@ def _smoke_test(
     print(f"attention_mask: {tuple(sample0['attention_mask'].shape)}")
     print(f"labels: {tuple(sample0['labels'].shape)}")
     print(f"entity_dist_vectors: {tuple(sample0['entity_dist_vectors'].shape)}")
+    print(f"entity_prompt_mask: {tuple(sample0['entity_prompt_mask'].shape)}")
     print(
         "masked label ratio:",
         float((sample0["labels"] == -100).sum().item()) / float(sample0["labels"].numel()),
+    )
+    print(
+        "prompt token ratio:",
+        float(sample0["entity_prompt_mask"].sum().item()) / float(sample0["entity_prompt_mask"].numel()),
     )
 
     collator = EDEFDataCollator(tokenizer=tokenizer, max_length=max_length)
@@ -341,6 +368,7 @@ def _smoke_test(
     print(f"attention_mask: {tuple(batch['attention_mask'].shape)}")
     print(f"labels: {tuple(batch['labels'].shape)}")
     print(f"entity_dist_vectors: {tuple(batch['entity_dist_vectors'].shape)}")
+    print(f"entity_prompt_mask: {tuple(batch['entity_prompt_mask'].shape)}")
 
     print("\nToken-distribution alignment preview (first 12 tokens):")
     preview_ids = sample0["input_ids"][:12].tolist()
