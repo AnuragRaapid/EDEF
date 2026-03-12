@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import json
 import os
 import sys
 import tempfile
@@ -14,7 +15,7 @@ import torch
 from peft import LoraConfig, get_peft_model
 from transformers import Qwen3Config, Qwen3ForCausalLM, TrainingArguments
 
-from edef_data import EDEFDataset, EDEFDataCollator, _MockTokenizer
+from edef_data import EDEFDataCollator, EDEFDataset, _MockTokenizer
 from edef_model import (
     attach_edef_to_model,
     edef_runtime_context,
@@ -27,6 +28,10 @@ from train_stage1 import EDEFTrainer as Stage1Trainer
 from train_stage1 import GateLoggingCallback as Stage1GateCallback
 from train_stage2 import EDEFTrainer as Stage2Trainer
 from train_stage2 import GateLoggingCallback as Stage2GateCallback
+from train_stage2 import (
+    _set_corrector_warmup_trainable_params as set_corrector_warmup_trainable_params,
+)
+from train_stage2 import _set_stage2_trainable_params as set_stage2_trainable_params
 
 DIST_DIM = 45
 SAMPLE_TEXT = "Patient presents with chest pain and shortness of breath. Prescribed aspirin 500 mg daily."
@@ -133,11 +138,15 @@ def build_mock_dataset() -> tuple[EDEFDataset, EDEFDataCollator, _MockTokenizer]
     return dataset, collator, tokenizer
 
 
-def build_batch(dataset: EDEFDataset, collator: EDEFDataCollator) -> dict[str, torch.Tensor]:
+def build_batch(
+    dataset: EDEFDataset, collator: EDEFDataCollator
+) -> dict[str, torch.Tensor]:
     return collator([dataset[0], dataset[1]])
 
 
-def move_batch_to_device(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
+def move_batch_to_device(
+    batch: dict[str, torch.Tensor], device: torch.device
+) -> dict[str, torch.Tensor]:
     return {key: value.to(device) for key, value in batch.items()}
 
 
@@ -159,6 +168,14 @@ def compute_deltas(model: Any, snapshot: dict[str, torch.Tensor]) -> dict[str, f
         after = named_params[name].detach()
         deltas[name] = float((after - before).abs().max().item())
     return deltas
+
+
+def load_last_jsonl_record(path: str) -> dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as handle:
+        rows = [line.strip() for line in handle if line.strip()]
+    if not rows:
+        raise ValueError(f"No JSONL records found in {path}")
+    return json.loads(rows[-1])
 
 
 def run_manual_step(
@@ -210,11 +227,18 @@ def test_modules_and_dataset() -> None:
     )
     report(
         "Assistant-side distributions are zeroed",
-        bool((sample["entity_dist_vectors"][~sample["entity_prompt_mask"]]).abs().sum().item() == 0.0),
+        bool(
+            (sample["entity_dist_vectors"][~sample["entity_prompt_mask"]])
+            .abs()
+            .sum()
+            .item()
+            == 0.0
+        ),
     )
     report(
         "Batch prompt mask collates correctly",
-        batch["entity_prompt_mask"].dtype == torch.bool and batch["entity_prompt_mask"].shape[:2] == batch["input_ids"].shape,
+        batch["entity_prompt_mask"].dtype == torch.bool
+        and batch["entity_prompt_mask"].shape[:2] == batch["input_ids"].shape,
         f"shape={tuple(batch['entity_prompt_mask'].shape)}",
     )
 
@@ -232,6 +256,9 @@ def test_stage1_manual_and_trainer(export_dir: str) -> str:
         dist_dim=DIST_DIM,
         hidden_dim=model.config.hidden_size,
         insertion_layer=1,
+        projector_bottleneck_dim=16,
+        projector_use_temperature=True,
+        fusion_projected_norm=True,
         corrector_layers=0,
         corrector_dim=32,
         corrector_heads=4,
@@ -242,6 +269,14 @@ def test_stage1_manual_and_trainer(export_dir: str) -> str:
         param.requires_grad = True
     for param in host.fusion_gate.parameters():
         param.requires_grad = True
+    report(
+        "Stage 1 projector temperature enabled",
+        host.entity_projector.log_temperature is not None,
+    )
+    report(
+        "Stage 1 fusion normalization enabled",
+        not isinstance(host.fusion_gate.projected_norm, torch.nn.Identity),
+    )
 
     device = next(model.parameters()).device
     batch = move_batch_to_device(batch, device)
@@ -250,7 +285,7 @@ def test_stage1_manual_and_trainer(export_dir: str) -> str:
     optimizer = torch.optim.AdamW(
         [
             {"params": list(host.entity_projector.parameters()), "lr": 1e-3},
-            {"params": list(host.fusion_gate.parameters()), "lr": 1e-3},
+            {"params": list(host.fusion_gate.parameters()), "lr": 3e-3},
         ]
     )
     loss, grad_norms = run_manual_step(model, batch, optimizer)
@@ -258,17 +293,35 @@ def test_stage1_manual_and_trainer(export_dir: str) -> str:
 
     projector_grad = max(v for k, v in grad_norms.items() if "entity_projector" in k)
     gate_grad = max(v for k, v in grad_norms.items() if "fusion_gate" in k)
-    report("Stage 1 loss is finite", bool(torch.isfinite(torch.tensor(loss)).item()), f"loss={loss:.4f}")
-    report("Stage 1 projector grad norm > 0", projector_grad > 0, f"{projector_grad:.6f}")
+    report(
+        "Stage 1 loss is finite",
+        bool(torch.isfinite(torch.tensor(loss)).item()),
+        f"loss={loss:.4f}",
+    )
+    report(
+        "Stage 1 projector grad norm > 0", projector_grad > 0, f"{projector_grad:.6f}"
+    )
     report("Stage 1 gate grad norm > 0", gate_grad > 0, f"{gate_grad:.6f}")
-    report("Stage 1 projector params changed", max(v for k, v in deltas.items() if "entity_projector" in k) > 0)
-    report("Stage 1 gate params changed", max(v for k, v in deltas.items() if "fusion_gate" in k) > 0)
+    report(
+        "Stage 1 projector params changed",
+        max(v for k, v in deltas.items() if "entity_projector" in k) > 0,
+    )
+    report(
+        "Stage 1 gate params changed",
+        max(v for k, v in deltas.items() if "fusion_gate" in k) > 0,
+    )
     frozen_after = next(model.model.layers[0].parameters()).detach()
-    report("Frozen backbone stayed unchanged", bool(torch.allclose(frozen_before, frozen_after)))
+    report(
+        "Frozen backbone stayed unchanged",
+        bool(torch.allclose(frozen_before, frozen_after)),
+    )
 
     stage1_ckpt = os.path.join(export_dir, "stage1_ckpt")
     save_edef_checkpoint(model, stage1_ckpt)
-    saved_state = {key: value.detach().clone() for key, value in host.entity_projector.state_dict().items()}
+    saved_state = {
+        key: value.detach().clone()
+        for key, value in host.entity_projector.state_dict().items()
+    }
     with torch.no_grad():
         next(host.entity_projector.parameters()).add_(1.0)
     load_edef_checkpoint(model, stage1_ckpt)
@@ -300,11 +353,23 @@ def test_stage1_manual_and_trainer(export_dir: str) -> str:
             train_dataset=torch.utils.data.Subset(dataset, range(2)),
             data_collator=collator,
             callbacks=[Stage1GateCallback(model=model, log_every_steps=1)],
-            edef_learning_rate=1e-3,
+            projector_learning_rate=1e-3,
+            gate_learning_rate=3e-3,
         )
         try:
             trainer.train()
             report("Stage 1 trainer one-step run", True)
+            diag_path = os.path.join(tmpdir, "stage1_training_diagnostics.jsonl")
+            diag_payload = load_last_jsonl_record(diag_path)
+            report("Stage 1 diagnostics file written", os.path.isfile(diag_path))
+            report(
+                "Stage 1 diagnostics include grad ratio",
+                "projector_to_gate_grad_rms_ratio" in diag_payload.get("ratios", {}),
+            )
+            report(
+                "Stage 1 diagnostics include gate update stats",
+                "update_rms" in diag_payload.get("groups", {}).get("gate", {}),
+            )
         except Exception as exc:
             report("Stage 1 trainer one-step run", False, str(exc))
 
@@ -323,6 +388,9 @@ def test_stage2_manual_trainer_and_prefill(stage1_ckpt: str) -> None:
         dist_dim=DIST_DIM,
         hidden_dim=model.config.hidden_size,
         insertion_layer=1,
+        projector_bottleneck_dim=16,
+        projector_use_temperature=True,
+        fusion_projected_norm=True,
         corrector_layers=2,
         corrector_dim=32,
         corrector_heads=4,
@@ -330,18 +398,44 @@ def test_stage2_manual_trainer_and_prefill(stage1_ckpt: str) -> None:
     )
     load_edef_checkpoint(model, stage1_ckpt)
     peft_model = get_peft_model(model, build_lora_config(insertion_layer=1))
+    warmup_ready = set_corrector_warmup_trainable_params(peft_model)
+    warmup_trainable = [
+        name
+        for name, param in peft_model.named_parameters()
+        if param.requires_grad
+        and any(
+            token in name
+            for token in ("late_corrector", "fusion_gate", "entity_projector", "lora_")
+        )
+    ]
+    report(
+        "Corrector warmup isolates corrector params",
+        warmup_ready
+        and warmup_trainable
+        and all("late_corrector" in name for name in warmup_trainable),
+        f"trainable={len(warmup_trainable)}",
+    )
+    set_stage2_trainable_params(peft_model)
 
     device = next(peft_model.parameters()).device
     batch = move_batch_to_device(batch, device)
-    before = snapshot_named_parameters(peft_model, lambda _name, param: param.requires_grad)
+    before = snapshot_named_parameters(
+        peft_model, lambda _name, param: param.requires_grad
+    )
 
     edef_params = [
         param
         for name, param in peft_model.named_parameters()
-        if param.requires_grad and any(token in name for token in ("entity_projector", "fusion_gate", "late_corrector"))
+        if param.requires_grad
+        and any(
+            token in name
+            for token in ("entity_projector", "fusion_gate", "late_corrector")
+        )
     ]
     lora_params = [
-        param for name, param in peft_model.named_parameters() if param.requires_grad and "lora_" in name
+        param
+        for name, param in peft_model.named_parameters()
+        if param.requires_grad and "lora_" in name
     ]
     optimizer = torch.optim.AdamW(
         [
@@ -356,15 +450,35 @@ def test_stage2_manual_trainer_and_prefill(stage1_ckpt: str) -> None:
     gate_grad = max(v for k, v in grad_norms.items() if "fusion_gate" in k)
     corrector_grad = max(v for k, v in grad_norms.items() if "late_corrector" in k)
     lora_grad = max(v for k, v in grad_norms.items() if "lora_" in k)
-    report("Stage 2 loss is finite", bool(torch.isfinite(torch.tensor(loss)).item()), f"loss={loss:.4f}")
-    report("Stage 2 projector grad norm > 0", projector_grad > 0, f"{projector_grad:.6f}")
+    report(
+        "Stage 2 loss is finite",
+        bool(torch.isfinite(torch.tensor(loss)).item()),
+        f"loss={loss:.4f}",
+    )
+    report(
+        "Stage 2 projector grad norm > 0", projector_grad > 0, f"{projector_grad:.6f}"
+    )
     report("Stage 2 gate grad norm > 0", gate_grad > 0, f"{gate_grad:.6f}")
-    report("Stage 2 corrector grad norm > 0", corrector_grad > 0, f"{corrector_grad:.6f}")
+    report(
+        "Stage 2 corrector grad norm > 0", corrector_grad > 0, f"{corrector_grad:.6f}"
+    )
     report("Stage 2 LoRA grad norm > 0", lora_grad > 0, f"{lora_grad:.6f}")
-    report("Stage 2 projector params changed", max(v for k, v in deltas.items() if "entity_projector" in k) > 0)
-    report("Stage 2 gate params changed", max(v for k, v in deltas.items() if "fusion_gate" in k) > 0)
-    report("Stage 2 corrector params changed", max(v for k, v in deltas.items() if "late_corrector" in k) > 0)
-    report("Stage 2 LoRA params changed", max(v for k, v in deltas.items() if "lora_" in k) > 0)
+    report(
+        "Stage 2 projector params changed",
+        max(v for k, v in deltas.items() if "entity_projector" in k) > 0,
+    )
+    report(
+        "Stage 2 gate params changed",
+        max(v for k, v in deltas.items() if "fusion_gate" in k) > 0,
+    )
+    report(
+        "Stage 2 corrector params changed",
+        max(v for k, v in deltas.items() if "late_corrector" in k) > 0,
+    )
+    report(
+        "Stage 2 LoRA params changed",
+        max(v for k, v in deltas.items() if "lora_" in k) > 0,
+    )
 
     with tempfile.TemporaryDirectory() as tmpdir:
         stage2_ckpt = os.path.join(tmpdir, "stage2_ckpt")
@@ -376,6 +490,9 @@ def test_stage2_manual_trainer_and_prefill(stage1_ckpt: str) -> None:
             dist_dim=DIST_DIM,
             hidden_dim=fresh_model.config.hidden_size,
             insertion_layer=1,
+            projector_bottleneck_dim=16,
+            projector_use_temperature=True,
+            fusion_projected_norm=True,
             corrector_layers=2,
             corrector_dim=32,
             corrector_heads=4,
@@ -400,12 +517,18 @@ def test_stage2_manual_trainer_and_prefill(stage1_ckpt: str) -> None:
             tokenize=False,
             add_generation_prompt=True,
         )
-        prompt_encoding = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
+        prompt_encoding = tokenizer(
+            prompt, return_tensors="pt", add_special_tokens=False
+        )
         prompt_ids = prompt_encoding["input_ids"].to(device)
         prompt_attention = prompt_encoding["attention_mask"].to(device)
-        prompt_dists = torch.zeros((1, prompt_ids.shape[1], DIST_DIM), device=device, dtype=torch.float32)
+        prompt_dists = torch.zeros(
+            (1, prompt_ids.shape[1], DIST_DIM), device=device, dtype=torch.float32
+        )
         prompt_dists[:, : min(6, prompt_ids.shape[1]), -1] = 1.0
-        prompt_mask = torch.zeros((1, prompt_ids.shape[1]), dtype=torch.bool, device=device)
+        prompt_mask = torch.zeros(
+            (1, prompt_ids.shape[1]), dtype=torch.bool, device=device
+        )
         prompt_mask[:, : min(6, prompt_ids.shape[1])] = True
         with torch.inference_mode():
             with edef_runtime_context(
@@ -456,6 +579,17 @@ def test_stage2_manual_trainer_and_prefill(stage1_ckpt: str) -> None:
         try:
             trainer.train()
             report("Stage 2 trainer one-step run", True)
+            diag_path = os.path.join(tmpdir, "stage2_training_diagnostics.jsonl")
+            diag_payload = load_last_jsonl_record(diag_path)
+            report("Stage 2 diagnostics file written", os.path.isfile(diag_path))
+            report(
+                "Stage 2 diagnostics include grad ratio",
+                "projector_to_gate_grad_rms_ratio" in diag_payload.get("ratios", {}),
+            )
+            report(
+                "Stage 2 diagnostics include LoRA stats",
+                "lora" in diag_payload.get("groups", {}),
+            )
         except Exception as exc:
             report("Stage 2 trainer one-step run", False, str(exc))
 

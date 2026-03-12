@@ -6,8 +6,8 @@ Includes ablation studies (gate=0) and per-entity-type analysis.
 
 import argparse
 import ast
-import importlib.util
 import importlib
+import importlib.util
 import json
 import math
 import os
@@ -21,6 +21,9 @@ import torch
 from peft import PeftModel
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.utils.import_utils import is_flash_attn_2_available
+
+from edef_paths import resolve_eval_helper_path, resolve_phase2_split_path
 
 if __package__:
     _dist_mod = importlib.import_module(".distribution_alignment", package=__package__)
@@ -64,7 +67,10 @@ def _robust_parse_ner_json(raw_text: str) -> list[tuple[str, str]]:
         try:
             data = json.loads(attempt_text)
             if "ner" in data:
-                return [(str(e).lower().strip(), str(t).lower().strip()) for e, t in data["ner"]]
+                return [
+                    (str(e).lower().strip(), str(t).lower().strip())
+                    for e, t in data["ner"]
+                ]
             return []
         except (json.JSONDecodeError, TypeError, ValueError):
             pass
@@ -73,7 +79,10 @@ def _robust_parse_ner_json(raw_text: str) -> list[tuple[str, str]]:
         try:
             data = ast.literal_eval(attempt_text)
             if isinstance(data, dict) and "ner" in data:
-                return [(str(e).lower().strip(), str(t).lower().strip()) for e, t in data["ner"]]
+                return [
+                    (str(e).lower().strip(), str(t).lower().strip())
+                    for e, t in data["ner"]
+                ]
             return []
         except (ValueError, SyntaxError):
             pass
@@ -82,9 +91,7 @@ def _robust_parse_ner_json(raw_text: str) -> list[tuple[str, str]]:
     json_match = re.search(r'\{["\']ner["\']\s*:\s*\[', text)
     if json_match:
         arr_start = json_match.end() - 1
-        pairs = re.findall(
-            r"""\[['"](.+?)['"],\s*['"](.+?)['"]\]""", text[arr_start:]
-        )
+        pairs = re.findall(r"""\[['"](.+?)['"],\s*['"](.+?)['"]\]""", text[arr_start:])
         if pairs:
             return [(e.lower().strip(), t.lower().strip()) for e, t in pairs]
 
@@ -92,7 +99,7 @@ def _robust_parse_ner_json(raw_text: str) -> list[tuple[str, str]]:
 
 
 def _load_eval_functions() -> tuple[Any, Any, Any, Any, Any]:
-    eval_file = Path(__file__).resolve().parents[1] / "Soft Prompt Tuning" / "evaluate_ner.py"
+    eval_file = resolve_eval_helper_path()
     spec = importlib.util.spec_from_file_location("evaluate_ner_module", str(eval_file))
     if spec is None or spec.loader is None:
         raise ImportError(f"Unable to load evaluation helpers from {eval_file}")
@@ -107,7 +114,9 @@ def _load_eval_functions() -> tuple[Any, Any, Any, Any, Any]:
     )
 
 
-parse_ner_json, exact_match, relaxed_match, calculate_metrics, evaluate_per_type = _load_eval_functions()
+parse_ner_json, exact_match, relaxed_match, calculate_metrics, evaluate_per_type = (
+    _load_eval_functions()
+)
 
 
 def _model_device(model: Any) -> torch.device:
@@ -117,15 +126,30 @@ def _model_device(model: Any) -> torch.device:
         return torch.device("cpu")
 
 
+def _resolve_attn_implementation(dtype: torch.dtype) -> str | None:
+    if not torch.cuda.is_available():
+        return None
+    if dtype in {torch.float16, torch.bfloat16} and is_flash_attn_2_available():
+        return "flash_attention_2"
+    return "sdpa"
+
+
 def load_edef_model(args: argparse.Namespace) -> tuple[Any, Any]:
-    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-    model = AutoModelForCausalLM.from_pretrained(
-        args.phase1_model,
-        torch_dtype=dtype,
-        device_map="auto",
-        trust_remote_code=True,
-        attn_implementation="flash_attention_2"
-    )
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        dtype = torch.bfloat16
+    elif torch.cuda.is_available():
+        dtype = torch.float16
+    else:
+        dtype = torch.float32
+    model_load_kwargs: dict[str, Any] = {
+        "torch_dtype": dtype,
+        "device_map": "auto",
+        "trust_remote_code": True,
+    }
+    attn_implementation = _resolve_attn_implementation(dtype)
+    if attn_implementation is not None:
+        model_load_kwargs["attn_implementation"] = attn_implementation
+    model = AutoModelForCausalLM.from_pretrained(args.phase1_model, **model_load_kwargs)
 
     hidden_dim = int(getattr(model.config, "hidden_size", 2560))
     edef_ckpt = os.path.join(args.model_path, "edef_checkpoint")
@@ -135,10 +159,14 @@ def load_edef_model(args: argparse.Namespace) -> tuple[Any, Any]:
         dist_dim=int(saved_cfg.get("dist_dim", args.dist_dim)),
         hidden_dim=hidden_dim,
         insertion_layer=int(saved_cfg.get("insertion_layer", 28)),
+        projector_bottleneck_dim=saved_cfg.get("projector_bottleneck_dim"),
+        projector_use_temperature=bool(
+            saved_cfg.get("projector_use_temperature", False)
+        ),
+        fusion_projected_norm=bool(saved_cfg.get("fusion_projected_norm", False)),
         corrector_layers=int(saved_cfg.get("corrector_layers", 2)),
         corrector_dim=int(saved_cfg.get("corrector_dim", 512)),
         corrector_heads=int(saved_cfg.get("corrector_heads", 8)),
-        edef_dtype=torch.float32,
     )
     model = PeftModel.from_pretrained(model, args.model_path)
 
@@ -149,7 +177,9 @@ def load_edef_model(args: argparse.Namespace) -> tuple[Any, Any]:
 
     model.eval()
 
-    tokenizer_path = args.model_path if os.path.exists(args.model_path) else args.phase1_model
+    tokenizer_path = (
+        args.model_path if os.path.exists(args.model_path) else args.phase1_model
+    )
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -162,7 +192,9 @@ def _build_prompt(tokenizer: Any, clinical_text: str) -> str:
         {"role": "system", "content": NER_INSTRUCTION},
         {"role": "user", "content": clinical_text},
     ]
-    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    return tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
 
 
 def _build_prompt_features(
@@ -175,14 +207,20 @@ def _build_prompt_features(
     encoding = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
     input_ids = encoding.input_ids.to(device)
     attention_mask = encoding.attention_mask.to(device)
-    dist_vectors = get_token_distributions(
-        prompt,
-        tokenizer,
-        word_entity_dist,
-        default_dist,
-        dist_dim=len(default_dist),
-    ).unsqueeze(0).to(device=device, dtype=torch.float32)
-    prompt_mask = torch.ones((1, dist_vectors.shape[1]), dtype=torch.bool, device=device)
+    dist_vectors = (
+        get_token_distributions(
+            prompt,
+            tokenizer,
+            word_entity_dist,
+            default_dist,
+            dist_dim=len(default_dist),
+        )
+        .unsqueeze(0)
+        .to(device=device, dtype=torch.float32)
+    )
+    prompt_mask = torch.ones(
+        (1, dist_vectors.shape[1]), dtype=torch.bool, device=device
+    )
     return input_ids, attention_mask, dist_vectors, prompt_mask
 
 
@@ -229,8 +267,16 @@ def _generate_with_mode(
     generated = tokenizer.decode(new_tokens, skip_special_tokens=True)
 
     stats = get_last_edef_stats(model)
-    token_gate = stats["token_gate"] if stats["token_gate"] is not None else torch.zeros(1, input_len)
-    aligned_dist = stats["aligned_dist"] if stats["aligned_dist"] is not None else dist_vectors.cpu()
+    token_gate = (
+        stats["token_gate"]
+        if stats["token_gate"] is not None
+        else torch.zeros(1, input_len)
+    )
+    aligned_dist = (
+        stats["aligned_dist"]
+        if stats["aligned_dist"] is not None
+        else dist_vectors.cpu()
+    )
     return generated.strip(), token_gate, aligned_dist
 
 
@@ -292,7 +338,10 @@ def _generate_batch_with_mode(
     tokenizer.padding_side = "left"
     try:
         encodings = tokenizer(
-            prompts, return_tensors="pt", padding=True, add_special_tokens=False,
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            add_special_tokens=False,
         )
     finally:
         tokenizer.padding_side = original_padding_side
@@ -302,11 +351,17 @@ def _generate_batch_with_mode(
     bsz, max_len = input_ids.shape
     dist_dim = len(default_dist)
 
-    dist_vectors = torch.zeros(bsz, max_len, dist_dim, device=device, dtype=torch.float32)
+    dist_vectors = torch.zeros(
+        bsz, max_len, dist_dim, device=device, dtype=torch.float32
+    )
     prompt_mask = torch.zeros(bsz, max_len, device=device, dtype=torch.bool)
     for idx, prompt in enumerate(prompts):
         dist = get_token_distributions(
-            prompt, tokenizer, word_entity_dist, default_dist, dist_dim=dist_dim,
+            prompt,
+            tokenizer,
+            word_entity_dist,
+            default_dist,
+            dist_dim=dist_dim,
         )
         prompt_len = int(attention_mask[idx].sum().item())
         actual_len = min(dist.shape[0], prompt_len)
@@ -333,8 +388,16 @@ def _generate_batch_with_mode(
             )
 
     stats = get_last_edef_stats(model)
-    token_gate = stats["token_gate"] if stats["token_gate"] is not None else torch.zeros(bsz, max_len)
-    aligned_dist = stats["aligned_dist"] if stats["aligned_dist"] is not None else dist_vectors.cpu()
+    token_gate = (
+        stats["token_gate"]
+        if stats["token_gate"] is not None
+        else torch.zeros(bsz, max_len)
+    )
+    aligned_dist = (
+        stats["aligned_dist"]
+        if stats["aligned_dist"] is not None
+        else dist_vectors.cpu()
+    )
 
     generated_texts: list[str] = []
     per_sample_gates: list[torch.Tensor] = []
@@ -432,7 +495,9 @@ def _summarize_gate_stats(
         return {}
 
     gate_values = torch.cat([g.reshape(-1) for g in collected_gate], dim=0)
-    dist_values = torch.cat([d.reshape(-1, d.shape[-1]) for d in collected_dists], dim=0)
+    dist_values = torch.cat(
+        [d.reshape(-1, d.shape[-1]) for d in collected_dists], dim=0
+    )
 
     default_idx = int(dist_values.shape[-1] - 1)
     token_type_idx = torch.argmax(dist_values, dim=-1)
@@ -442,7 +507,9 @@ def _summarize_gate_stats(
     non_entity_gate = gate_values[~is_entity]
 
     per_type: dict[str, dict[str, float | int]] = {}
-    unique_idxs = torch.unique(token_type_idx[is_entity]) if is_entity.any() else torch.tensor([])
+    unique_idxs = (
+        torch.unique(token_type_idx[is_entity]) if is_entity.any() else torch.tensor([])
+    )
     for idx_tensor in unique_idxs:
         idx = int(idx_tensor.item())
         mask = token_type_idx == idx
@@ -456,8 +523,12 @@ def _summarize_gate_stats(
 
     return {
         "overall_mean_gate": float(gate_values.mean().item()),
-        "entity_tokens_mean_gate": float(entity_gate.mean().item()) if entity_gate.numel() else 0.0,
-        "non_entity_tokens_mean_gate": float(non_entity_gate.mean().item()) if non_entity_gate.numel() else 0.0,
+        "entity_tokens_mean_gate": float(entity_gate.mean().item())
+        if entity_gate.numel()
+        else 0.0,
+        "non_entity_tokens_mean_gate": float(non_entity_gate.mean().item())
+        if non_entity_gate.numel()
+        else 0.0,
         "entity_token_count": int(entity_gate.numel()),
         "non_entity_token_count": int(non_entity_gate.numel()),
         "per_entity_type_mean_gate": per_type,
@@ -494,7 +565,9 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
 
     print(f"Running EDEF evaluation on {num_samples} samples (batch_size={batch_size})")
     print(f"Raw predictions will be saved to: {raw_pred_path}")
-    with tqdm(total=num_samples, desc="EDEF Eval", unit="sample", dynamic_ncols=True) as pbar:
+    with tqdm(
+        total=num_samples, desc="EDEF Eval", unit="sample", dynamic_ncols=True
+    ) as pbar:
         for batch_idx in range(num_batches):
             start_idx = batch_idx * batch_size
             end_idx = min(start_idx + batch_size, num_samples)
@@ -505,13 +578,20 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
 
             start = time.time()
             gen_texts, batch_gates, batch_dists = _generate_batch_with_mode(
-                model, tokenizer, batch_texts, word_entity_dist, default_dist,
-                max_new_tokens=args.max_new_tokens, force_gate_zero=False,
+                model,
+                tokenizer,
+                batch_texts,
+                word_entity_dist,
+                default_dist,
+                max_new_tokens=args.max_new_tokens,
+                force_gate_zero=False,
             )
             elapsed = time.time() - start
             per_sample_time = elapsed / len(batch_texts)
 
-            for i, (pred_text, gold_text) in enumerate(zip(gen_texts, batch_gold_texts)):
+            for i, (pred_text, gold_text) in enumerate(
+                zip(gen_texts, batch_gold_texts)
+            ):
                 sample_idx = start_idx + i
                 timings.append(per_sample_time)
 
@@ -530,35 +610,47 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                     collected_dists.append(batch_dists[i])
 
                 # Write raw prediction for every sample
-                raw_pred_file.write(json.dumps({
-                    "sample_idx": sample_idx,
-                    "raw_prediction": pred_text,
-                    "parsed_pred_count": len(pred_entities),
-                    "gold_count": len(gold_entities),
-                    "gold_text": gold_text,
-                }, ensure_ascii=False) + "\n")
+                raw_pred_file.write(
+                    json.dumps(
+                        {
+                            "sample_idx": sample_idx,
+                            "raw_prediction": pred_text,
+                            "parsed_pred_count": len(pred_entities),
+                            "gold_count": len(gold_entities),
+                            "gold_text": gold_text,
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
 
                 # Print first few samples for quick sanity check
                 if sample_idx < 3:
-                    print(f"\n  [Sample {sample_idx}] raw (first 200): {pred_text[:200]}")
-                    print(f"  [Sample {sample_idx}] parsed preds: {len(pred_entities)}, golds: {len(gold_entities)}")
+                    print(
+                        f"\n  [Sample {sample_idx}] raw (first 200): {pred_text[:200]}"
+                    )
+                    print(
+                        f"  [Sample {sample_idx}] parsed preds: {len(pred_entities)}, golds: {len(gold_entities)}"
+                    )
 
             pbar.update(len(batch_texts))
 
-            running_tp = sum(
-                len(set(p) & set(g)) for p, g in zip(predictions, golds)
+            running_tp = sum(len(set(p) & set(g)) for p, g in zip(predictions, golds))
+            pbar.set_postfix(
+                {
+                    "s/sample": f"{per_sample_time:.2f}",
+                    "batch": f"{batch_idx + 1}/{num_batches}",
+                    "running_tp": running_tp,
+                }
             )
-            pbar.set_postfix({
-                "s/sample": f"{per_sample_time:.2f}",
-                "batch": f"{batch_idx + 1}/{num_batches}",
-                "running_tp": running_tp,
-            })
 
     raw_pred_file.close()
     print(f"\nRaw predictions saved to: {raw_pred_path}")
 
     eval_metrics = _aggregate_metrics(predictions, golds, word_margin=2)
-    gate_stats = _summarize_gate_stats(collected_gate, collected_dists, entity_type_by_idx)
+    gate_stats = _summarize_gate_stats(
+        collected_gate, collected_dists, entity_type_by_idx
+    )
 
     exact_f1_pct = eval_metrics["exact"]["f1"] * 100.0
     relaxed_f1_pct = eval_metrics["relaxed"]["f1"] * 100.0
@@ -584,19 +676,30 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         print("\nRunning ablation (gate forced to zero)...")
         ablation_preds: list[list[tuple[str, str]]] = []
         ablation_timings: list[float] = []
-        ablation_raw_path = os.path.join(args.output_dir, "ablation_raw_predictions.jsonl")
+        ablation_raw_path = os.path.join(
+            args.output_dir, "ablation_raw_predictions.jsonl"
+        )
         ablation_raw_file = open(ablation_raw_path, "w", encoding="utf-8")
 
-        with tqdm(total=num_samples, desc="Ablation", unit="sample", dynamic_ncols=True) as pbar:
+        with tqdm(
+            total=num_samples, desc="Ablation", unit="sample", dynamic_ncols=True
+        ) as pbar:
             for batch_idx in range(num_batches):
                 start_idx = batch_idx * batch_size
                 end_idx = min(start_idx + batch_size, num_samples)
-                batch_texts = [str(s.get("input", "")) for s in test_samples[start_idx:end_idx]]
+                batch_texts = [
+                    str(s.get("input", "")) for s in test_samples[start_idx:end_idx]
+                ]
 
                 start = time.time()
                 gen_texts, _, _ = _generate_batch_with_mode(
-                    model, tokenizer, batch_texts, word_entity_dist, default_dist,
-                    max_new_tokens=args.max_new_tokens, force_gate_zero=True,
+                    model,
+                    tokenizer,
+                    batch_texts,
+                    word_entity_dist,
+                    default_dist,
+                    max_new_tokens=args.max_new_tokens,
+                    force_gate_zero=True,
                 )
                 elapsed = time.time() - start
                 per_sample_time = elapsed / len(batch_texts)
@@ -605,11 +708,17 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                     ablation_timings.append(per_sample_time)
                     parsed = _robust_parse_ner_json(pred_text)
                     ablation_preds.append(parsed)
-                    ablation_raw_file.write(json.dumps({
-                        "sample_idx": start_idx + j,
-                        "raw_prediction": pred_text,
-                        "parsed_pred_count": len(parsed),
-                    }, ensure_ascii=False) + "\n")
+                    ablation_raw_file.write(
+                        json.dumps(
+                            {
+                                "sample_idx": start_idx + j,
+                                "raw_prediction": pred_text,
+                                "parsed_pred_count": len(parsed),
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
 
                 pbar.update(len(batch_texts))
                 pbar.set_postfix({"s/sample": f"{per_sample_time:.2f}"})
@@ -649,12 +758,14 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate EDEF-enhanced NER model")
     parser.add_argument("--model_path", type=str, default="saves/late-edef-stage2")
-    parser.add_argument("--base_model", type=str, default="unsloth/Qwen3-4B-Instruct-2507")
+    parser.add_argument(
+        "--base_model", type=str, default="unsloth/Qwen3-4B-Instruct-2507"
+    )
     parser.add_argument("--phase1_model", type=str, default="./qwen3-phase1-checkpoint")
     parser.add_argument(
         "--test_data",
         type=str,
-        default="/home/anurag/NER/Multi-task Finetuning/Multitask Finetuning Phase 2 Dataset/test_ner_filtered.json",
+        default=resolve_phase2_split_path("test_ner_filtered.json"),
     )
     parser.add_argument(
         "--dist_path",
@@ -663,7 +774,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output_dir", type=str, default="evaluation_results")
     parser.add_argument("--max_new_tokens", type=int, default=2048)
-    parser.add_argument("--batch_size", type=int, default=64, help="Batch size for inference (reduce if OOM)")
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=64,
+        help="Batch size for inference (reduce if OOM)",
+    )
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--baseline_f1", type=float, default=85.07)
     parser.add_argument("--dist_dim", type=int, default=45)
@@ -677,4 +793,3 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     evaluate(parse_args())
-

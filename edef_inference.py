@@ -93,14 +93,20 @@ def _build_prompt_features(
     encoding = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)
     input_ids = encoding["input_ids"].to(device)
     attention_mask = encoding["attention_mask"].to(device)
-    dist_vectors = get_token_distributions(
-        text=prompt_text,
-        tokenizer=tokenizer,
-        word_entity_dist=word_entity_dist,
-        default_dist=default_dist,
-        dist_dim=dist_dim,
-    ).unsqueeze(0).to(device=device, dtype=torch.float32)
-    prompt_mask = torch.ones((1, dist_vectors.shape[1]), dtype=torch.bool, device=device)
+    dist_vectors = (
+        get_token_distributions(
+            text=prompt_text,
+            tokenizer=tokenizer,
+            word_entity_dist=word_entity_dist,
+            default_dist=default_dist,
+            dist_dim=dist_dim,
+        )
+        .unsqueeze(0)
+        .to(device=device, dtype=torch.float32)
+    )
+    prompt_mask = torch.ones(
+        (1, dist_vectors.shape[1]), dtype=torch.bool, device=device
+    )
     return input_ids, attention_mask, dist_vectors, prompt_mask
 
 
@@ -149,25 +155,42 @@ class EDEFInferencePipeline:
 
         edef_ckpt = os.path.join(model_path, "edef_checkpoint")
         saved_cfg = load_edef_config(edef_ckpt) if os.path.isdir(edef_ckpt) else {}
-        hidden = hidden_dim if hidden_dim is not None else int(getattr(model.config, "hidden_size", 2560))
+        hidden = (
+            hidden_dim
+            if hidden_dim is not None
+            else int(getattr(model.config, "hidden_size", 2560))
+        )
         model = attach_edef_to_model(
             model,
             dist_dim=int(saved_cfg.get("dist_dim", dist_dim)),
             hidden_dim=hidden,
-            insertion_layer=int(saved_cfg.get("insertion_layer", insertion_layer if insertion_layer is not None else 28)),
+            insertion_layer=int(
+                saved_cfg.get(
+                    "insertion_layer",
+                    insertion_layer if insertion_layer is not None else 28,
+                )
+            ),
+            projector_bottleneck_dim=saved_cfg.get("projector_bottleneck_dim"),
+            projector_use_temperature=bool(
+                saved_cfg.get("projector_use_temperature", False)
+            ),
+            fusion_projected_norm=bool(saved_cfg.get("fusion_projected_norm", False)),
             corrector_layers=int(saved_cfg.get("corrector_layers", corrector_layers)),
             corrector_dim=int(saved_cfg.get("corrector_dim", corrector_dim)),
             corrector_heads=int(saved_cfg.get("corrector_heads", corrector_heads)),
-            edef_dtype=torch.float32,
         )
         model = PeftModel.from_pretrained(model, model_path)
         if os.path.isdir(edef_ckpt):
             load_edef_checkpoint(model, edef_ckpt)
 
         tokenizer_source = (
-            model_path if os.path.exists(os.path.join(model_path, "tokenizer_config.json")) else model_source
+            model_path
+            if os.path.exists(os.path.join(model_path, "tokenizer_config.json"))
+            else model_source
         )
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, trust_remote_code=trust_remote_code)
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_source, trust_remote_code=trust_remote_code
+        )
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
@@ -176,7 +199,9 @@ class EDEFInferencePipeline:
         model.eval()
         return cls(model, tokenizer, word_entity_dist, default_dist, dist_dim=dist_dim)
 
-    def predict(self, text: str, max_new_tokens: int = 2048, temperature: float = 0.0) -> dict[str, Any]:
+    def predict(
+        self, text: str, max_new_tokens: int = 2048, temperature: float = 0.0
+    ) -> dict[str, Any]:
         prompt_text = _build_chat_prompt(self.tokenizer, text)
         input_ids, attention_mask, dist_vectors, prompt_mask = _build_prompt_features(
             prompt_text,
@@ -220,7 +245,10 @@ class EDEFInferencePipeline:
         max_new_tokens: int = 2048,
         temperature: float = 0.0,
     ) -> list[dict[str, Any]]:
-        return [self.predict(text, max_new_tokens=max_new_tokens, temperature=temperature) for text in texts]
+        return [
+            self.predict(text, max_new_tokens=max_new_tokens, temperature=temperature)
+            for text in texts
+        ]
 
 
 def _load_texts_from_json(input_file: str) -> list[str]:
@@ -228,7 +256,9 @@ def _load_texts_from_json(input_file: str) -> list[str]:
         data = json.load(f)
 
     if not isinstance(data, list):
-        raise ValueError("--input_file JSON must be a list of strings or list of {input: text} objects.")
+        raise ValueError(
+            "--input_file JSON must be a list of strings or list of {input: text} objects."
+        )
 
     texts: list[str] = []
     for item in data:
@@ -237,15 +267,25 @@ def _load_texts_from_json(input_file: str) -> list[str]:
         elif isinstance(item, dict) and "input" in item:
             texts.append(str(item["input"]))
         else:
-            raise ValueError("Invalid JSON entry. Expected string or object with an 'input' field.")
+            raise ValueError(
+                "Invalid JSON entry. Expected string or object with an 'input' field."
+            )
     return texts
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Late-correction EDEF clinical NER inference")
-    parser.add_argument("--model_path", required=True, help="Stage 2 model path (LoRA + late EDEF)")
-    parser.add_argument("--phase1_model", required=True, help="Phase 1 merged model path")
-    parser.add_argument("--base_model", default="Qwen/Qwen3-4B-Instruct", help="Base model name")
+    parser = argparse.ArgumentParser(
+        description="Late-correction EDEF clinical NER inference"
+    )
+    parser.add_argument(
+        "--model_path", required=True, help="Stage 2 model path (LoRA + late EDEF)"
+    )
+    parser.add_argument(
+        "--phase1_model", required=True, help="Phase 1 merged model path"
+    )
+    parser.add_argument(
+        "--base_model", default="Qwen/Qwen3-4B-Instruct", help="Base model name"
+    )
     parser.add_argument("--dist_path", required=True, help="Entity distributions JSON")
 
     io_group = parser.add_mutually_exclusive_group(required=True)
@@ -256,8 +296,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_new_tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--device_map", default="auto")
-    parser.add_argument("--torch_dtype", default="auto", help="auto|bfloat16|float16|float32")
-    parser.add_argument("--trust_remote_code", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--torch_dtype", default="auto", help="auto|bfloat16|float16|float32"
+    )
+    parser.add_argument(
+        "--trust_remote_code", action=argparse.BooleanOptionalAction, default=True
+    )
     return parser
 
 
@@ -286,7 +330,10 @@ def main() -> None:
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
         )
-        output_payload = [{"input": text, "prediction": pred} for text, pred in zip(texts, predictions)]
+        output_payload = [
+            {"input": text, "prediction": pred}
+            for text, pred in zip(texts, predictions)
+        ]
 
     output_text = json.dumps(output_payload, ensure_ascii=False, indent=2)
     if args.output_file:

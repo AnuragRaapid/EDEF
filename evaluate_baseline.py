@@ -15,6 +15,7 @@ import time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from edef_paths import resolve_phase2_split_path
 
 NER_INSTRUCTION = (
     "You are an expert medical Named Entity Recognition (NER) assistant. "
@@ -115,7 +116,11 @@ def relaxed_match(
 def calculate_metrics(tp: int, fp: int, fn: int) -> tuple[float, float, float]:
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if (precision + recall) > 0
+        else 0.0
+    )
     return precision, recall, f1
 
 
@@ -184,7 +189,9 @@ def resolve_dtype() -> torch.dtype:
     return torch.float32
 
 
-def load_model_and_tokenizer(model_path: str, adapter_path: str | None, base_model: str):
+def load_model_and_tokenizer(
+    model_path: str, adapter_path: str | None, base_model: str
+):
     dtype = resolve_dtype()
     tokenizer_source = model_path if os.path.exists(model_path) else base_model
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, trust_remote_code=True)
@@ -220,7 +227,9 @@ def build_prompt(tokenizer, text: str) -> str:
         {"role": "system", "content": NER_INSTRUCTION},
         {"role": "user", "content": text},
     ]
-    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    return tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
 
 
 def extract_ner_json_string(generated_text: str) -> str:
@@ -236,8 +245,8 @@ def extract_ner_json_string(generated_text: str) -> str:
     if text.startswith("json"):
         text = text[4:].strip()
 
-    if "{\"ner\"" in text:
-        start = text.find("{\"ner\"")
+    if '{"ner"' in text:
+        start = text.find('{"ner"')
         end = text.rfind("}")
         if start != -1 and end != -1 and end > start:
             return text[start : end + 1]
@@ -251,7 +260,9 @@ def extract_ner_json_string(generated_text: str) -> str:
     return text
 
 
-def generate_prediction(model, tokenizer, text: str, max_new_tokens: int) -> tuple[str, float]:
+def generate_prediction(
+    model, tokenizer, text: str, max_new_tokens: int
+) -> tuple[str, float]:
     prompt = build_prompt(tokenizer, text)
     encoded = tokenizer(prompt, return_tensors="pt")
 
@@ -283,7 +294,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--test_data",
         type=str,
-        default="/home/anurag/NER/Multi-task Finetuning/Multitask Finetuning Phase 2 Dataset/test_ner_filtered.json",
+        default=resolve_phase2_split_path("test_ner_filtered.json"),
     )
     parser.add_argument("--output_dir", type=str, default="evaluation_results")
     parser.add_argument("--max_new_tokens", type=int, default=2048)

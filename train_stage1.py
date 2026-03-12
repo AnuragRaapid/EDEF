@@ -9,14 +9,23 @@ import os
 from typing import Any
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainerCallback, TrainingArguments
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    Trainer,
+    TrainingArguments,
+)
 
 from edef_data import EDEFDataCollator, build_edef_dataset
 from edef_model import attach_edef_to_model, get_edef_host, save_edef_checkpoint
+from edef_paths import resolve_phase2_split_path
+from edef_training_logging import Stage1DiagnosticsCallback as GateLoggingCallback
 
 
 def _should_use_bf16(requested: bool) -> bool:
-    return bool(requested and torch.cuda.is_available() and torch.cuda.is_bf16_supported())
+    return bool(
+        requested and torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    )
 
 
 def _resolve_model_dtype(use_bf16: bool) -> torch.dtype:
@@ -24,9 +33,16 @@ def _resolve_model_dtype(use_bf16: bool) -> torch.dtype:
 
 
 class EDEFTrainer(Trainer):
-    def __init__(self, *args: Any, edef_learning_rate: float, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        projector_learning_rate: float,
+        gate_learning_rate: float,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
-        self.edef_learning_rate = edef_learning_rate
+        self.projector_learning_rate = projector_learning_rate
+        self.gate_learning_rate = gate_learning_rate
 
     def compute_loss(
         self,
@@ -52,56 +68,77 @@ class EDEFTrainer(Trainer):
         if self.optimizer is not None:
             return self.optimizer
 
-        decay_params: list[torch.nn.Parameter] = []
-        no_decay_params: list[torch.nn.Parameter] = []
+        projector_decay: list[torch.nn.Parameter] = []
+        projector_no_decay: list[torch.nn.Parameter] = []
+        gate_decay: list[torch.nn.Parameter] = []
+        gate_no_decay: list[torch.nn.Parameter] = []
+
         for name, param in self.model.named_parameters():
             if not param.requires_grad:
                 continue
-            if name.endswith(".bias") or "norm" in name.lower():
-                no_decay_params.append(param)
+            if "fusion_gate" in name:
+                target_list = (
+                    gate_no_decay
+                    if name.endswith(".bias") or "norm" in name.lower()
+                    else gate_decay
+                )
             else:
-                decay_params.append(param)
+                target_list = (
+                    projector_no_decay
+                    if name.endswith(".bias") or "norm" in name.lower()
+                    else projector_decay
+                )
+            target_list.append(param)
+
+        optimizer_groups: list[dict[str, Any]] = []
+        if projector_decay:
+            optimizer_groups.append(
+                {
+                    "group_name": "projector_decay",
+                    "params": projector_decay,
+                    "lr": self.projector_learning_rate,
+                    "weight_decay": self.args.weight_decay,
+                }
+            )
+        if projector_no_decay:
+            optimizer_groups.append(
+                {
+                    "group_name": "projector_no_decay",
+                    "params": projector_no_decay,
+                    "lr": self.projector_learning_rate,
+                    "weight_decay": 0.0,
+                }
+            )
+        if gate_decay:
+            optimizer_groups.append(
+                {
+                    "group_name": "gate_decay",
+                    "params": gate_decay,
+                    "lr": self.gate_learning_rate,
+                    "weight_decay": self.args.weight_decay,
+                }
+            )
+        if gate_no_decay:
+            optimizer_groups.append(
+                {
+                    "group_name": "gate_no_decay",
+                    "params": gate_no_decay,
+                    "lr": self.gate_learning_rate,
+                    "weight_decay": 0.0,
+                }
+            )
 
         self.optimizer = torch.optim.AdamW(
-            [
-                {
-                    "params": decay_params,
-                    "lr": self.edef_learning_rate,
-                    "weight_decay": self.args.weight_decay,
-                },
-                {
-                    "params": no_decay_params,
-                    "lr": self.edef_learning_rate,
-                    "weight_decay": 0.0,
-                },
-            ],
+            optimizer_groups,
             betas=(0.9, 0.999),
         )
         return self.optimizer
 
 
-class GateLoggingCallback(TrainerCallback):
-    def __init__(self, model: Any, log_every_steps: int = 100) -> None:
-        self.model = model
-        self.log_every_steps = log_every_steps
-
-    def on_step_end(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
-        del args, control, kwargs
-        if state.global_step <= 0 or state.global_step % self.log_every_steps != 0:
-            return
-
-        host = get_edef_host(self.model)
-        gate_bias = host.fusion_gate.gate_net.bias
-        with torch.no_grad():
-            gate_sigmoid = torch.sigmoid(gate_bias.detach())
-            print(
-                f"Step {state.global_step}: late gate sigmoid mean={gate_sigmoid.mean().item():.4f}, "
-                f"min={gate_sigmoid.min().item():.4f}, max={gate_sigmoid.max().item():.4f}"
-            )
-
-
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Stage 1 late-correction EDEF training.")
+    parser = argparse.ArgumentParser(
+        description="Stage 1 late-correction EDEF training."
+    )
     parser.add_argument(
         "--phase1_model",
         type=str,
@@ -123,12 +160,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--train_data",
         type=str,
-        default="/home/anurag/NER/Multi-task Finetuning/Multitask Finetuning Phase 2 Dataset/train_ner_filtered.json",
+        default=resolve_phase2_split_path("train_ner_filtered.json"),
     )
     parser.add_argument(
         "--val_data",
         type=str,
-        default="/home/anurag/NER/Multi-task Finetuning/Multitask Finetuning Phase 2 Dataset/val_ner_filtered.json",
+        default=resolve_phase2_split_path("val_ner_filtered.json"),
     )
     parser.add_argument("--dist_path", type=str, default="./entity_distributions.json")
     parser.add_argument("--output_dir", type=str, default="saves/late-edef-stage1")
@@ -136,15 +173,56 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--grad_accum", type=int, default=8)
     parser.add_argument("--epochs", type=float, default=3.0)
-    parser.add_argument("--lr", type=float, default=1e-3, help="Alias for --edef_lr")
-    parser.add_argument("--edef_lr", type=float, default=None, help="Stage 1 learning rate for late EDEF modules.")
+    parser.add_argument(
+        "--lr", type=float, default=1e-3, help="Alias for --projector_lr"
+    )
+    parser.add_argument(
+        "--edef_lr",
+        type=float,
+        default=None,
+        help="Deprecated alias for --projector_lr.",
+    )
+    parser.add_argument(
+        "--projector_lr",
+        type=float,
+        default=None,
+        help="Stage 1 learning rate for the projector.",
+    )
+    parser.add_argument(
+        "--gate_lr",
+        type=float,
+        default=None,
+        help="Stage 1 learning rate for the gate.",
+    )
+    parser.add_argument(
+        "--gate_lr_scale",
+        type=float,
+        default=3.0,
+        help="Multiplier applied to projector_lr when --gate_lr is not set.",
+    )
     parser.add_argument("--warmup_ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--save_steps", type=int, default=500)
-    parser.add_argument("--gate_log_steps", type=int, default=100)
+    parser.add_argument(
+        "--gate_log_steps",
+        type=int,
+        default=100,
+        help="How often to log EDEF diagnostics. Set 0 to disable.",
+    )
     parser.add_argument("--insertion_layer", type=int, default=28)
+    parser.add_argument("--projector_bottleneck_dim", type=int, default=512)
+    parser.add_argument(
+        "--projector_use_temperature",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--fusion_projected_norm",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--corrector_dim", type=int, default=512)
     parser.add_argument("--corrector_heads", type=int, default=8)
     return parser.parse_args()
@@ -181,8 +259,10 @@ def print_trainable_params(model: Any) -> None:
 def main() -> None:
     args = parse_args()
     torch.manual_seed(args.seed)
-    if args.edef_lr is None:
-        args.edef_lr = args.lr
+    if args.projector_lr is None:
+        args.projector_lr = args.edef_lr if args.edef_lr is not None else args.lr
+    if args.gate_lr is None:
+        args.gate_lr = args.projector_lr * args.gate_lr_scale
 
     tokenizer_source = args.base_model if args.phase1_adapter else args.phase1_model
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, trust_remote_code=True)
@@ -203,10 +283,12 @@ def main() -> None:
         dist_dim=45,
         hidden_dim=hidden_dim,
         insertion_layer=args.insertion_layer,
+        projector_bottleneck_dim=args.projector_bottleneck_dim,
+        projector_use_temperature=args.projector_use_temperature,
+        fusion_projected_norm=args.fusion_projected_norm,
         corrector_layers=0,
         corrector_dim=args.corrector_dim,
         corrector_heads=args.corrector_heads,
-        edef_dtype=torch.float32,
     )
 
     host = get_edef_host(model)
@@ -222,6 +304,9 @@ def main() -> None:
         model.config.use_cache = False
 
     print_trainable_params(model)
+    print(
+        f"Stage 1 learning rates: projector={args.projector_lr:.2e}, gate={args.gate_lr:.2e}"
+    )
 
     print("Building datasets...")
     train_dataset = build_edef_dataset(
@@ -248,7 +333,7 @@ def main() -> None:
         per_device_eval_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
         num_train_epochs=args.epochs,
-        learning_rate=args.edef_lr,
+        learning_rate=args.projector_lr,
         lr_scheduler_type="cosine",
         warmup_ratio=args.warmup_ratio,
         bf16=use_bf16,
@@ -274,8 +359,11 @@ def main() -> None:
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=data_collator,
-        callbacks=[GateLoggingCallback(model=model, log_every_steps=args.gate_log_steps)],
-        edef_learning_rate=args.edef_lr,
+        callbacks=[
+            GateLoggingCallback(model=model, log_every_steps=args.gate_log_steps)
+        ],
+        projector_learning_rate=args.projector_lr,
+        gate_learning_rate=args.gate_lr,
     )
 
     print("Starting Stage 1 late-correction training...")

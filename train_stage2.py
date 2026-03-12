@@ -14,8 +14,10 @@ from peft import LoraConfig, PeftModel, get_peft_model
 from transformers.models.auto.modeling_auto import AutoModelForCausalLM
 from transformers.models.auto.tokenization_auto import AutoTokenizer
 from transformers.trainer import Trainer
-from transformers.trainer_callback import TrainerCallback
 from transformers.training_args import TrainingArguments
+
+from edef_paths import resolve_phase2_split_path
+from edef_training_logging import Stage2DiagnosticsCallback as GateLoggingCallback
 
 if __package__:
     _data_mod = importlib.import_module(".edef_data", package=__package__)
@@ -35,7 +37,9 @@ save_edef_checkpoint = _model_mod.save_edef_checkpoint
 
 
 def _should_use_bf16(requested: bool) -> bool:
-    return bool(requested and torch.cuda.is_available() and torch.cuda.is_bf16_supported())
+    return bool(
+        requested and torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    )
 
 
 def _resolve_model_dtype(use_bf16: bool) -> torch.dtype:
@@ -92,50 +96,70 @@ class EDEFTrainer(Trainer):
             )
             target_list = None
             if is_edef:
-                target_list = edef_no_decay if name.endswith(".bias") or "norm" in name.lower() else edef_decay
+                target_list = (
+                    edef_no_decay
+                    if name.endswith(".bias") or "norm" in name.lower()
+                    else edef_decay
+                )
             else:
-                target_list = lora_no_decay if name.endswith(".bias") or "norm" in name.lower() else lora_decay
+                target_list = (
+                    lora_no_decay
+                    if name.endswith(".bias") or "norm" in name.lower()
+                    else lora_decay
+                )
             target_list.append(param)
 
-        self.optimizer = torch.optim.AdamW(
-            [
-                {"params": edef_decay, "lr": self.edef_learning_rate, "weight_decay": self.args.weight_decay},
-                {"params": edef_no_decay, "lr": self.edef_learning_rate, "weight_decay": 0.0},
-                {"params": lora_decay, "lr": self.lora_learning_rate, "weight_decay": self.args.weight_decay},
-                {"params": lora_no_decay, "lr": self.lora_learning_rate, "weight_decay": 0.0},
-            ],
-            betas=(0.9, 0.999),
-        )
+        optimizer_groups: list[dict[str, Any]] = []
+        if edef_decay:
+            optimizer_groups.append(
+                {
+                    "group_name": "edef_decay",
+                    "params": edef_decay,
+                    "lr": self.edef_learning_rate,
+                    "weight_decay": self.args.weight_decay,
+                }
+            )
+        if edef_no_decay:
+            optimizer_groups.append(
+                {
+                    "group_name": "edef_no_decay",
+                    "params": edef_no_decay,
+                    "lr": self.edef_learning_rate,
+                    "weight_decay": 0.0,
+                }
+            )
+        if lora_decay:
+            optimizer_groups.append(
+                {
+                    "group_name": "lora_decay",
+                    "params": lora_decay,
+                    "lr": self.lora_learning_rate,
+                    "weight_decay": self.args.weight_decay,
+                }
+            )
+        if lora_no_decay:
+            optimizer_groups.append(
+                {
+                    "group_name": "lora_no_decay",
+                    "params": lora_no_decay,
+                    "lr": self.lora_learning_rate,
+                    "weight_decay": 0.0,
+                }
+            )
+
+        self.optimizer = torch.optim.AdamW(optimizer_groups, betas=(0.9, 0.999))
         return self.optimizer
 
 
-class GateLoggingCallback(TrainerCallback):
-    def __init__(self, model: Any, log_every_steps: int = 100):
-        self.model = model
-        self.log_every_steps = log_every_steps
-
-    def on_step_end(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
-        del args, control, kwargs
-        if state.global_step <= 0 or state.global_step % self.log_every_steps != 0:
-            return
-
-        host = get_edef_host(self.model)
-        gate_sigmoid = torch.sigmoid(host.fusion_gate.gate_net.bias.detach())
-        msg = (
-            f"Step {state.global_step}: late gate sigmoid mean={gate_sigmoid.mean().item():.4f}, "
-            f"min={gate_sigmoid.min().item():.4f}, max={gate_sigmoid.max().item():.4f}"
-        )
-        if hasattr(host, "late_corrector"):
-            corrector_gate = torch.sigmoid(host.late_corrector.output_gate.detach())
-            msg += f", corrector gate mean={corrector_gate.mean().item():.4f}"
-        print(msg)
-
-
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Stage 2 late-correction EDEF training.")
+    parser = argparse.ArgumentParser(
+        description="Stage 2 late-correction EDEF training."
+    )
     parser.add_argument("--phase1_model", type=str, default="./qwen3-phase1-checkpoint")
     parser.add_argument("--phase1_adapter", type=str, default=None)
-    parser.add_argument("--base_model", type=str, default="unsloth/Qwen3-4B-Instruct-2507")
+    parser.add_argument(
+        "--base_model", type=str, default="unsloth/Qwen3-4B-Instruct-2507"
+    )
     parser.add_argument(
         "--stage1_checkpoint",
         type=str,
@@ -145,12 +169,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--train_data",
         type=str,
-        default="/home/anurag/NER/Multi-task Finetuning/Multitask Finetuning Phase 2 Dataset/train_ner_filtered.json",
+        default=resolve_phase2_split_path("train_ner_filtered.json"),
     )
     parser.add_argument(
         "--val_data",
         type=str,
-        default="/home/anurag/NER/Multi-task Finetuning/Multitask Finetuning Phase 2 Dataset/val_ner_filtered.json",
+        default=resolve_phase2_split_path("val_ner_filtered.json"),
     )
     parser.add_argument("--dist_path", type=str, default="./entity_distributions.json")
     parser.add_argument("--output_dir", type=str, default="saves/late-edef-stage2")
@@ -159,20 +183,52 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad_accum", type=int, default=8)
     parser.add_argument("--epochs", type=float, default=2.0)
     parser.add_argument("--lr", type=float, default=2e-4, help="LoRA learning rate.")
-    parser.add_argument("--edef_lr", type=float, default=1e-3, help="Late module learning rate.")
+    parser.add_argument(
+        "--edef_lr", type=float, default=1e-3, help="Late module learning rate."
+    )
     parser.add_argument("--warmup_ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--save_steps", type=int, default=300)
-    parser.add_argument("--gate_log_steps", type=int, default=100)
+    parser.add_argument(
+        "--gate_log_steps",
+        type=int,
+        default=100,
+        help="How often to log EDEF diagnostics. Set 0 to disable.",
+    )
     parser.add_argument("--lora_r", type=int, default=32)
     parser.add_argument("--lora_alpha", type=int, default=64)
     parser.add_argument("--insertion_layer", type=int, default=None)
+    parser.add_argument("--projector_bottleneck_dim", type=int, default=512)
+    parser.add_argument(
+        "--projector_use_temperature",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--fusion_projected_norm",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--corrector_layers", type=int, default=2)
     parser.add_argument("--corrector_dim", type=int, default=512)
     parser.add_argument("--corrector_heads", type=int, default=8)
-    parser.add_argument("--use_dora", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--corrector_warmup_epochs",
+        type=float,
+        default=1.0,
+        help="Warm up the late corrector alone before joint Stage 2 training.",
+    )
+    parser.add_argument(
+        "--corrector_warmup_lr",
+        type=float,
+        default=None,
+        help="Learning rate used during the corrector-only warmup. Defaults to --edef_lr.",
+    )
+    parser.add_argument(
+        "--use_dora", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument(
         "--skip_stage1",
         action="store_true",
@@ -198,8 +254,11 @@ def load_phase1_model(args: argparse.Namespace) -> Any:
     return AutoModelForCausalLM.from_pretrained(args.phase1_model, **load_kwargs)
 
 
-def _resolve_stage1_attach_args(args: argparse.Namespace) -> dict[str, int]:
-    config_payload = load_edef_config(args.stage1_checkpoint) if os.path.isdir(args.stage1_checkpoint) else {}
+def _resolve_stage1_attach_args(args: argparse.Namespace) -> dict[str, Any]:
+    use_stage1_config = (not args.skip_stage1) and os.path.isdir(args.stage1_checkpoint)
+    config_payload = (
+        load_edef_config(args.stage1_checkpoint) if use_stage1_config else {}
+    )
     insertion_layer = (
         args.insertion_layer
         if args.insertion_layer is not None
@@ -207,8 +266,22 @@ def _resolve_stage1_attach_args(args: argparse.Namespace) -> dict[str, int]:
     )
     return {
         "insertion_layer": insertion_layer,
+        "projector_bottleneck_dim": config_payload.get(
+            "projector_bottleneck_dim",
+            args.projector_bottleneck_dim,
+        ),
+        "projector_use_temperature": bool(
+            config_payload.get(
+                "projector_use_temperature", args.projector_use_temperature
+            )
+        ),
+        "fusion_projected_norm": bool(
+            config_payload.get("fusion_projected_norm", args.fusion_projected_norm)
+        ),
         "corrector_dim": int(config_payload.get("corrector_dim", args.corrector_dim)),
-        "corrector_heads": int(config_payload.get("corrector_heads", args.corrector_heads)),
+        "corrector_heads": int(
+            config_payload.get("corrector_heads", args.corrector_heads)
+        ),
     }
 
 
@@ -217,6 +290,77 @@ def _build_modules_to_save(host: Any) -> list[str]:
     if hasattr(host, "late_corrector"):
         modules_to_save.append("late_corrector")
     return modules_to_save
+
+
+def _freeze_all_parameters(model: Any) -> None:
+    for param in model.parameters():
+        param.requires_grad = False
+
+
+def _set_stage2_trainable_params(model: Any) -> None:
+    _freeze_all_parameters(model)
+    for name, param in model.named_parameters():
+        if "lora_" in name:
+            param.requires_grad = True
+
+    host = get_edef_host(model)
+    for module_name in ("entity_projector", "fusion_gate", "late_corrector"):
+        module = getattr(host, module_name, None)
+        if module is None:
+            continue
+        for param in module.parameters():
+            param.requires_grad = True
+
+
+def _set_corrector_warmup_trainable_params(model: Any) -> bool:
+    _freeze_all_parameters(model)
+    host = get_edef_host(model)
+    corrector = getattr(host, "late_corrector", None)
+    if corrector is None:
+        return False
+    for param in corrector.parameters():
+        param.requires_grad = True
+    return True
+
+
+def _build_training_args(
+    args: argparse.Namespace,
+    output_dir: str,
+    num_train_epochs: float,
+    learning_rate: float,
+    *,
+    save_strategy: str,
+    eval_strategy: str,
+) -> TrainingArguments:
+    use_bf16 = _should_use_bf16(args.bf16)
+    training_kwargs: dict[str, Any] = {
+        "output_dir": output_dir,
+        "per_device_train_batch_size": args.batch_size,
+        "per_device_eval_batch_size": args.batch_size,
+        "gradient_accumulation_steps": args.grad_accum,
+        "num_train_epochs": num_train_epochs,
+        "learning_rate": learning_rate,
+        "lr_scheduler_type": "cosine",
+        "warmup_ratio": args.warmup_ratio,
+        "bf16": use_bf16,
+        "fp16": False,
+        "tf32": torch.cuda.is_available(),
+        "optim": "adamw_torch",
+        "weight_decay": 0.01,
+        "logging_steps": args.logging_steps,
+        "save_strategy": save_strategy,
+        "eval_strategy": eval_strategy,
+        "remove_unused_columns": False,
+        "seed": args.seed,
+        "dataloader_pin_memory": torch.cuda.is_available(),
+        "dataloader_num_workers": 2,
+        "report_to": "none",
+    }
+    if save_strategy == "steps":
+        training_kwargs["save_steps"] = args.save_steps
+    if eval_strategy == "steps":
+        training_kwargs["eval_steps"] = args.save_steps
+    return TrainingArguments(**training_kwargs)
 
 
 def main() -> None:
@@ -239,15 +383,21 @@ def main() -> None:
         dist_dim=45,
         hidden_dim=hidden_dim,
         insertion_layer=attach_args["insertion_layer"],
+        projector_bottleneck_dim=attach_args["projector_bottleneck_dim"],
+        projector_use_temperature=attach_args["projector_use_temperature"],
+        fusion_projected_norm=attach_args["fusion_projected_norm"],
         corrector_layers=args.corrector_layers,
-        corrector_dim=args.corrector_dim,
-        corrector_heads=args.corrector_heads,
-        edef_dtype=torch.float32,
+        corrector_dim=attach_args["corrector_dim"],
+        corrector_heads=attach_args["corrector_heads"],
     )
 
     if not args.skip_stage1 and os.path.isdir(args.stage1_checkpoint):
         load_edef_checkpoint(model, args.stage1_checkpoint)
         print(f"Loaded Stage 1 late EDEF checkpoint from {args.stage1_checkpoint}")
+    elif args.skip_stage1:
+        print(
+            "Skipping Stage 1 checkpoint load and starting projector/gate from scratch."
+        )
     else:
         print("Starting projector/gate from scratch (no Stage 1 checkpoint found)")
 
@@ -256,12 +406,22 @@ def main() -> None:
     num_layers = get_decoder_layer_count(model)
     top_lora_layers = list(range(host.edef_insertion_layer + 1, num_layers))
     if not top_lora_layers:
-        raise ValueError("LoRA target layer list is empty; insertion_layer is too close to the top")
+        raise ValueError(
+            "LoRA target layer list is empty; insertion_layer is too close to the top"
+        )
 
     lora_config = LoraConfig(
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        target_modules=[
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ],
         layers_to_transform=top_lora_layers,
         layers_pattern="layers",
         modules_to_save=modules_to_save,
@@ -271,6 +431,7 @@ def main() -> None:
         task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, lora_config)
+    _set_stage2_trainable_params(model)
 
     gradient_checkpoint_fn = getattr(model, "gradient_checkpointing_enable", None)
     if callable(gradient_checkpoint_fn):
@@ -278,8 +439,6 @@ def main() -> None:
     config = getattr(model, "config", None)
     if config is not None and hasattr(config, "use_cache"):
         setattr(config, "use_cache", False)
-
-    model.print_trainable_parameters()
 
     print("Building datasets...")
     train_dataset = build_edef_dataset(
@@ -299,31 +458,62 @@ def main() -> None:
     data_collator = EDEFDataCollator(tokenizer=tokenizer, max_length=args.max_length)
 
     os.makedirs(args.output_dir, exist_ok=True)
-    use_bf16 = _should_use_bf16(args.bf16)
-    training_args = TrainingArguments(
+
+    should_run_warmup = (
+        args.corrector_warmup_epochs > 0
+        and not args.skip_stage1
+        and os.path.isdir(args.stage1_checkpoint)
+        and hasattr(get_edef_host(model), "late_corrector")
+    )
+    if should_run_warmup:
+        warmup_lr = (
+            args.corrector_warmup_lr
+            if args.corrector_warmup_lr is not None
+            else args.edef_lr
+        )
+        if _set_corrector_warmup_trainable_params(model):
+            warmup_args = _build_training_args(
+                args,
+                output_dir=os.path.join(args.output_dir, "corrector_warmup"),
+                num_train_epochs=args.corrector_warmup_epochs,
+                learning_rate=warmup_lr,
+                save_strategy="no",
+                eval_strategy="no",
+            )
+            warmup_trainer = EDEFTrainer(
+                model=model,
+                args=warmup_args,
+                train_dataset=train_dataset,
+                eval_dataset=None,
+                data_collator=data_collator,
+                callbacks=[
+                    GateLoggingCallback(
+                        model=model,
+                        log_every_steps=args.gate_log_steps,
+                        stage_name="stage2_corrector_warmup",
+                    )
+                ],
+                lora_learning_rate=args.lr,
+                edef_learning_rate=warmup_lr,
+            )
+            print(
+                f"Starting corrector warmup for {args.corrector_warmup_epochs:.2f} epoch(s) "
+                f"at lr={warmup_lr:.2e}..."
+            )
+            warmup_trainer.train()
+            _set_stage2_trainable_params(model)
+    elif args.corrector_warmup_epochs > 0:
+        print("Skipping corrector warmup because no Stage 1 checkpoint was loaded.")
+
+    model.print_trainable_parameters()
+
+    training_args = _build_training_args(
+        args,
         output_dir=args.output_dir,
-        per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
-        gradient_accumulation_steps=args.grad_accum,
         num_train_epochs=args.epochs,
         learning_rate=args.lr,
-        lr_scheduler_type="cosine",
-        warmup_ratio=args.warmup_ratio,
-        bf16=use_bf16,
-        fp16=False,
-        tf32=torch.cuda.is_available(),
-        optim="adamw_torch",
-        weight_decay=0.01,
-        logging_steps=args.logging_steps,
         save_strategy="steps",
-        save_steps=args.save_steps,
         eval_strategy="steps",
-        eval_steps=args.save_steps,
-        remove_unused_columns=False,
-        seed=args.seed,
-        dataloader_pin_memory=torch.cuda.is_available(),
-        dataloader_num_workers=2,
-        report_to="none",
     )
 
     trainer = EDEFTrainer(
@@ -332,7 +522,9 @@ def main() -> None:
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=data_collator,
-        callbacks=[GateLoggingCallback(model=model, log_every_steps=args.gate_log_steps)],
+        callbacks=[
+            GateLoggingCallback(model=model, log_every_steps=args.gate_log_steps)
+        ],
         lora_learning_rate=args.lr,
         edef_learning_rate=args.edef_lr,
     )

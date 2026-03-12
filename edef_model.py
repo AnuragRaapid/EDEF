@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any
 
 import torch
@@ -15,7 +15,9 @@ from edef_modules import EntityDistProjector, GatedFusion, LateCorrectionTransfo
 
 
 def _search_module_with_layers(module: nn.Module, depth: int = 4) -> nn.Module | None:
-    if hasattr(module, "layers") and isinstance(getattr(module, "layers"), nn.ModuleList):
+    if hasattr(module, "layers") and isinstance(
+        getattr(module, "layers"), nn.ModuleList
+    ):
         return module
     if depth <= 0:
         return None
@@ -29,7 +31,9 @@ def _search_module_with_layers(module: nn.Module, depth: int = 4) -> nn.Module |
 def _resolve_backbone(model: nn.Module) -> nn.Module:
     backbone = _search_module_with_layers(model)
     if backbone is None:
-        raise AttributeError("Could not locate decoder backbone with a .layers ModuleList")
+        raise AttributeError(
+            "Could not locate decoder backbone with a .layers ModuleList"
+        )
     return backbone
 
 
@@ -37,7 +41,9 @@ def _resolve_decoder_layers(model: nn.Module) -> nn.ModuleList:
     backbone = _resolve_backbone(model)
     layers = getattr(backbone, "layers", None)
     if not isinstance(layers, nn.ModuleList):
-        raise AttributeError("Model backbone must expose decoder layers as nn.ModuleList")
+        raise AttributeError(
+            "Model backbone must expose decoder layers as nn.ModuleList"
+        )
     return layers
 
 
@@ -55,6 +61,13 @@ def _get_module_device(module: nn.Module) -> torch.device:
         return torch.device("cpu")
 
 
+def _get_module_dtype(module: nn.Module) -> torch.dtype:
+    try:
+        return next(module.parameters()).dtype
+    except StopIteration:
+        return torch.float32
+
+
 def _align_dist_to_seq(
     dist: torch.Tensor,
     seq_len: int,
@@ -63,7 +76,9 @@ def _align_dist_to_seq(
     target_dtype: torch.dtype,
 ) -> torch.Tensor:
     if dist.dim() != 3:
-        raise ValueError("entity_dist_vectors must have shape (batch, seq_len, dist_dim)")
+        raise ValueError(
+            "entity_dist_vectors must have shape (batch, seq_len, dist_dim)"
+        )
     if dist.shape[0] != batch_size:
         raise ValueError(
             f"Batch size mismatch: dist batch={dist.shape[0]} vs hidden batch={batch_size}"
@@ -136,17 +151,103 @@ def _module_dtype_name(module: nn.Module) -> str:
         return "float32"
 
 
+def _resolve_edef_dtype(
+    model: nn.Module, requested_dtype: torch.dtype | None
+) -> torch.dtype:
+    if requested_dtype is not None:
+        return requested_dtype
+    try:
+        return next(model.parameters()).dtype
+    except StopIteration:
+        return torch.float32
+
+
 def _get_edef_modules(model: nn.Module) -> tuple[nn.Module, nn.Module]:
     projector = getattr(model, "entity_projector", None)
     fusion_gate = getattr(model, "fusion_gate", None)
     if not isinstance(projector, nn.Module) or not isinstance(fusion_gate, nn.Module):
-        raise AttributeError("Model must expose entity_projector and fusion_gate modules")
+        raise AttributeError(
+            "Model must expose entity_projector and fusion_gate modules"
+        )
     return projector, fusion_gate
 
 
 def _get_late_corrector(model: nn.Module) -> nn.Module | None:
     corrector = getattr(model, "late_corrector", None)
     return corrector if isinstance(corrector, nn.Module) else None
+
+
+def _infer_edef_config_from_checkpoint(checkpoint_path: str) -> dict[str, Any]:
+    inferred: dict[str, Any] = {}
+
+    projector_path = os.path.join(checkpoint_path, "entity_projector.pt")
+    if os.path.isfile(projector_path):
+        try:
+            projector_state = torch.load(projector_path, map_location="cpu")
+        except Exception:
+            projector_state = None
+        if isinstance(projector_state, dict):
+            if (
+                "projector.4.weight" in projector_state
+                and "projector.0.weight" in projector_state
+            ):
+                inferred["projector_bottleneck_dim"] = int(
+                    projector_state["projector.0.weight"].shape[0]
+                )
+            else:
+                inferred["projector_bottleneck_dim"] = None
+            inferred["projector_use_temperature"] = "log_temperature" in projector_state
+            first_tensor = next(
+                (
+                    value
+                    for value in projector_state.values()
+                    if isinstance(value, torch.Tensor)
+                ),
+                None,
+            )
+            if isinstance(first_tensor, torch.Tensor):
+                inferred["edef_dtype"] = str(first_tensor.dtype).replace("torch.", "")
+
+    fusion_path = os.path.join(checkpoint_path, "fusion_gate.pt")
+    if os.path.isfile(fusion_path):
+        try:
+            fusion_state = torch.load(fusion_path, map_location="cpu")
+        except Exception:
+            fusion_state = None
+        if isinstance(fusion_state, dict):
+            inferred["fusion_projected_norm"] = any(
+                key.startswith("projected_norm.") for key in fusion_state
+            )
+
+    return inferred
+
+
+def _load_module_state(
+    module: nn.Module, state_dict: dict[str, Any], module_name: str
+) -> None:
+    current_state = module.state_dict()
+    compatible_state: dict[str, Any] = {}
+    skipped_keys: list[str] = []
+
+    for key, value in state_dict.items():
+        current_value = current_state.get(key)
+        if (
+            current_value is None
+            or not isinstance(value, torch.Tensor)
+            or current_value.shape != value.shape
+        ):
+            skipped_keys.append(key)
+            continue
+        compatible_state[key] = value
+
+    incompatible = module.load_state_dict(compatible_state, strict=False)
+    if skipped_keys or incompatible.missing_keys or incompatible.unexpected_keys:
+        print(
+            f"[WARN] Loaded {module_name} with compatibility fallback: "
+            f"missing={len(incompatible.missing_keys)}, "
+            f"skipped={len(skipped_keys)}, "
+            f"unexpected={len(incompatible.unexpected_keys)}"
+        )
 
 
 def get_edef_host(model: nn.Module) -> nn.Module:
@@ -181,16 +282,22 @@ def get_edef_host(model: nn.Module) -> nn.Module:
 
 
 def get_decoder_layer_count(model: nn.Module) -> int:
-    host = get_edef_host(model) if hasattr(model, "entity_projector") or hasattr(model, "base_model") else model
+    host = (
+        get_edef_host(model)
+        if hasattr(model, "entity_projector") or hasattr(model, "base_model")
+        else model
+    )
     return len(_resolve_decoder_layers(host))
 
 
 def load_edef_config(checkpoint_path: str) -> dict[str, Any]:
     config_path = os.path.join(checkpoint_path, "edef_config.json")
+    inferred = _infer_edef_config_from_checkpoint(checkpoint_path)
     if not os.path.isfile(config_path):
-        return {}
+        return inferred
     with open(config_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        payload = json.load(f)
+    return {**inferred, **payload}
 
 
 class _LateEDEFRuntime:
@@ -248,12 +355,14 @@ class _LateEDEFRuntime:
         original_dtype = hidden_states.dtype
         device = hidden_states.device
         batch_size, seq_len = hidden_states.shape[:2]
+        projector, fusion_gate = _get_edef_modules(self.host_model)
+        compute_dtype = _get_module_dtype(projector)
         aligned_dist = _align_dist_to_seq(
             self.entity_dist_vectors,
             seq_len=seq_len,
             batch_size=batch_size,
             target_device=device,
-            target_dtype=torch.float32,
+            target_dtype=compute_dtype,
         )
         prompt_mask = _align_mask_to_seq(
             self.entity_prompt_mask,
@@ -264,17 +373,25 @@ class _LateEDEFRuntime:
         if prompt_mask is None:
             prompt_mask = self._derive_prompt_mask(aligned_dist)
 
-        with torch.amp.autocast(device_type=device.type, enabled=False):
-            hidden_fp32 = hidden_states.to(torch.float32)
-            projector, fusion_gate = _get_edef_modules(self.host_model)
+        autocast_enabled = (
+            device.type == "cuda" and compute_dtype in {torch.float16, torch.bfloat16}
+        ) or (device.type == "cpu" and compute_dtype == torch.bfloat16)
+        autocast_context = (
+            torch.amp.autocast(device_type=device.type, dtype=compute_dtype)
+            if autocast_enabled
+            else nullcontext()
+        )
+
+        with autocast_context:
+            hidden_input = hidden_states.to(compute_dtype)
             projected = projector(aligned_dist)
 
             if self.ablate:
-                corrected = hidden_fp32
-                token_gate = hidden_fp32.new_zeros(hidden_fp32.shape[:2])
+                corrected = hidden_input
+                token_gate = hidden_input.new_zeros(hidden_input.shape[:2])
             else:
                 fused, gate_values = fusion_gate(
-                    hidden_fp32,
+                    hidden_input,
                     projected,
                     prompt_mask=prompt_mask,
                     return_gate=True,
@@ -343,15 +460,23 @@ def attach_edef_to_model(
     dist_dim: int = 45,
     hidden_dim: int | None = None,
     insertion_layer: int | None = None,
+    projector_bottleneck_dim: int | None = None,
+    projector_use_temperature: bool = False,
+    fusion_projected_norm: bool = False,
     corrector_layers: int = 0,
     corrector_dim: int = 512,
     corrector_heads: int = 8,
-    edef_dtype: torch.dtype = torch.float32,
+    edef_dtype: torch.dtype | None = None,
 ) -> nn.Module:
     if hidden_dim is None:
         hidden_dim = int(getattr(getattr(model, "config", None), "hidden_size", 2560))
+    if projector_bottleneck_dim is not None and projector_bottleneck_dim <= 0:
+        projector_bottleneck_dim = None
 
-    if hasattr(model, "_edef_hook_handle") and getattr(model, "_edef_hook_handle") is not None:
+    if (
+        hasattr(model, "_edef_hook_handle")
+        and getattr(model, "_edef_hook_handle") is not None
+    ):
         model._edef_hook_handle.remove()
         model._edef_hook_handle = None
 
@@ -365,13 +490,22 @@ def attach_edef_to_model(
         )
 
     insertion_device = _get_module_device(layers[insertion_layer])
-    model.entity_projector = EntityDistProjector(dist_dim, hidden_dim).to(
+    resolved_edef_dtype = _resolve_edef_dtype(model, edef_dtype)
+    model.entity_projector = EntityDistProjector(
+        dist_dim=dist_dim,
+        hidden_dim=hidden_dim,
+        bottleneck_dim=projector_bottleneck_dim,
+        use_temperature_scaling=projector_use_temperature,
+    ).to(
         device=insertion_device,
-        dtype=edef_dtype,
+        dtype=resolved_edef_dtype,
     )
-    model.fusion_gate = GatedFusion(hidden_dim).to(
+    model.fusion_gate = GatedFusion(
+        hidden_dim=hidden_dim,
+        normalize_projected=fusion_projected_norm,
+    ).to(
         device=insertion_device,
-        dtype=edef_dtype,
+        dtype=resolved_edef_dtype,
     )
     if corrector_layers > 0:
         model.late_corrector = LateCorrectionTransformer(
@@ -379,17 +513,22 @@ def attach_edef_to_model(
             bottleneck_dim=corrector_dim,
             num_layers=corrector_layers,
             num_heads=corrector_heads,
-        ).to(device=insertion_device, dtype=edef_dtype)
+        ).to(device=insertion_device, dtype=resolved_edef_dtype)
     elif hasattr(model, "late_corrector"):
         delattr(model, "late_corrector")
 
     model.edef_dist_dim = int(dist_dim)
     model.edef_hidden_dim = int(hidden_dim)
     model.edef_insertion_layer = int(insertion_layer)
+    model.edef_projector_bottleneck_dim = (
+        int(projector_bottleneck_dim) if projector_bottleneck_dim is not None else None
+    )
+    model.edef_projector_use_temperature = bool(projector_use_temperature)
+    model.edef_fusion_projected_norm = bool(fusion_projected_norm)
     model.edef_corrector_layers = int(corrector_layers)
     model.edef_corrector_dim = int(corrector_dim)
     model.edef_corrector_heads = int(corrector_heads)
-    model.edef_dtype = str(edef_dtype).replace("torch.", "")
+    model.edef_dtype = str(resolved_edef_dtype).replace("torch.", "")
 
     runtime = _LateEDEFRuntime(model)
     handle = layers[insertion_layer].register_forward_hook(runtime.hook)
@@ -409,7 +548,9 @@ def attach_edef_to_model(
         **kwargs: Any,
     ) -> Any:
         if entity_dist_vectors is None:
-            return original_forward(input_ids=input_ids, inputs_embeds=inputs_embeds, **kwargs)
+            return original_forward(
+                input_ids=input_ids, inputs_embeds=inputs_embeds, **kwargs
+            )
         with edef_runtime_context(
             model,
             entity_dist_vectors=entity_dist_vectors,
@@ -417,7 +558,9 @@ def attach_edef_to_model(
             ablate=late_edef_ablate,
             prefill_only=False,
         ):
-            return original_forward(input_ids=input_ids, inputs_embeds=inputs_embeds, **kwargs)
+            return original_forward(
+                input_ids=input_ids, inputs_embeds=inputs_embeds, **kwargs
+            )
 
     model.forward = edef_forward
     return model
@@ -436,15 +579,17 @@ def load_edef_checkpoint(model: nn.Module, checkpoint_path: str) -> nn.Module:
         os.path.join(checkpoint_path, "fusion_gate.pt"),
         map_location="cpu",
     )
-    projector_module.load_state_dict(projector_state)
-    fusion_module.load_state_dict(fusion_state)
+    _load_module_state(projector_module, projector_state, "entity_projector")
+    _load_module_state(fusion_module, fusion_state, "fusion_gate")
 
     corrector_path = os.path.join(checkpoint_path, "late_corrector.pt")
     if corrector_module is not None and os.path.isfile(corrector_path):
         corrector_state = torch.load(corrector_path, map_location="cpu")
-        corrector_module.load_state_dict(corrector_state)
+        _load_module_state(corrector_module, corrector_state, "late_corrector")
 
-    target_device = _get_module_device(_resolve_decoder_layers(host)[host.edef_insertion_layer])
+    target_device = _get_module_device(
+        _resolve_decoder_layers(host)[host.edef_insertion_layer]
+    )
     projector_module.to(device=target_device)
     fusion_module.to(device=target_device)
     if corrector_module is not None:
@@ -458,19 +603,34 @@ def save_edef_checkpoint(model: nn.Module, save_path: str) -> None:
     corrector_module = _get_late_corrector(host)
 
     os.makedirs(save_path, exist_ok=True)
-    torch.save(projector_module.state_dict(), os.path.join(save_path, "entity_projector.pt"))
+    torch.save(
+        projector_module.state_dict(), os.path.join(save_path, "entity_projector.pt")
+    )
     torch.save(fusion_module.state_dict(), os.path.join(save_path, "fusion_gate.pt"))
     if corrector_module is not None:
-        torch.save(corrector_module.state_dict(), os.path.join(save_path, "late_corrector.pt"))
+        torch.save(
+            corrector_module.state_dict(), os.path.join(save_path, "late_corrector.pt")
+        )
 
     payload = {
         "dist_dim": int(getattr(host, "edef_dist_dim", 45)),
         "hidden_dim": int(getattr(host, "edef_hidden_dim", 2560)),
         "insertion_layer": int(getattr(host, "edef_insertion_layer", 0)),
+        "projector_bottleneck_dim": getattr(
+            host, "edef_projector_bottleneck_dim", None
+        ),
+        "projector_use_temperature": bool(
+            getattr(host, "edef_projector_use_temperature", False)
+        ),
+        "fusion_projected_norm": bool(
+            getattr(host, "edef_fusion_projected_norm", False)
+        ),
         "corrector_layers": int(getattr(host, "edef_corrector_layers", 0)),
         "corrector_dim": int(getattr(host, "edef_corrector_dim", 512)),
         "corrector_heads": int(getattr(host, "edef_corrector_heads", 8)),
-        "edef_dtype": str(getattr(host, "edef_dtype", _module_dtype_name(projector_module))),
+        "edef_dtype": str(
+            getattr(host, "edef_dtype", _module_dtype_name(projector_module))
+        ),
     }
     with open(os.path.join(save_path, "edef_config.json"), "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=True)
@@ -521,7 +681,8 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory(prefix="late_edef_ckpt_") as ckpt_dir:
         save_edef_checkpoint(model, ckpt_dir)
         projector_before = {
-            key: value.detach().clone() for key, value in model.entity_projector.state_dict().items()
+            key: value.detach().clone()
+            for key, value in model.entity_projector.state_dict().items()
         }
         with torch.no_grad():
             first_param = next(model.entity_projector.parameters())
@@ -530,4 +691,6 @@ if __name__ == "__main__":
         for key, value in model.entity_projector.state_dict().items():
             assert torch.allclose(projector_before[key], value)
 
-    print("Late EDEF smoke test passed: forward path, stats capture, and checkpoint round-trip.")
+    print(
+        "Late EDEF smoke test passed: forward path, stats capture, and checkpoint round-trip."
+    )

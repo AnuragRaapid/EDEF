@@ -9,13 +9,40 @@ import torch.nn as nn
 class EntityDistProjector(nn.Module):
     """Project 45-d entity distributions into the model hidden space."""
 
-    def __init__(self, dist_dim: int = 45, hidden_dim: int = 2560) -> None:
+    def __init__(
+        self,
+        dist_dim: int = 45,
+        hidden_dim: int = 2560,
+        bottleneck_dim: int | None = None,
+        use_temperature_scaling: bool = False,
+    ) -> None:
         super().__init__()
-        self.projector = nn.Sequential(
-            nn.Linear(dist_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
+        self.bottleneck_dim = (
+            int(bottleneck_dim) if bottleneck_dim is not None else None
         )
+        if self.bottleneck_dim is not None and self.bottleneck_dim <= 0:
+            raise ValueError("bottleneck_dim must be positive when provided")
+
+        self.use_temperature_scaling = bool(use_temperature_scaling)
+        if self.use_temperature_scaling:
+            self.log_temperature = nn.Parameter(torch.zeros(()))
+        else:
+            self.register_parameter("log_temperature", None)
+
+        if self.bottleneck_dim is None:
+            self.projector = nn.Sequential(
+                nn.Linear(dist_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+        else:
+            self.projector = nn.Sequential(
+                nn.Linear(dist_dim, self.bottleneck_dim),
+                nn.GELU(),
+                nn.Linear(self.bottleneck_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -24,8 +51,18 @@ class EntityDistProjector(nn.Module):
                 nn.init.normal_(module.weight, std=0.01)
                 nn.init.zeros_(module.bias)
 
+    def _scale_distributions(self, dist_vectors: torch.Tensor) -> torch.Tensor:
+        if self.log_temperature is None:
+            return dist_vectors
+
+        safe_dist = dist_vectors.float().clamp_min(1e-6)
+        temperature = self.log_temperature.float().exp().clamp(0.25, 4.0)
+        scaled = torch.softmax(torch.log(safe_dist) / temperature, dim=-1)
+        return scaled.to(dtype=dist_vectors.dtype)
+
     def forward(self, dist_vectors: torch.Tensor) -> torch.Tensor:
-        return self.projector(dist_vectors)
+        scaled = self._scale_distributions(dist_vectors)
+        return self.projector(scaled)
 
 
 class GatedFusion(nn.Module):
@@ -35,8 +72,13 @@ class GatedFusion(nn.Module):
     without destabilizing the frozen backbone.
     """
 
-    def __init__(self, hidden_dim: int = 2560) -> None:
+    def __init__(
+        self, hidden_dim: int = 2560, normalize_projected: bool = False
+    ) -> None:
         super().__init__()
+        self.projected_norm = (
+            nn.LayerNorm(hidden_dim) if normalize_projected else nn.Identity()
+        )
         self.gate_net = nn.Linear(hidden_dim * 2, hidden_dim)
         self._init_weights()
 
@@ -51,11 +93,12 @@ class GatedFusion(nn.Module):
         prompt_mask: torch.Tensor | None = None,
         return_gate: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        combined = torch.cat([token_states, projected_features], dim=-1)
+        normalized_features = self.projected_norm(projected_features)
+        combined = torch.cat([token_states, normalized_features], dim=-1)
         gate = torch.sigmoid(self.gate_net(combined))
         if prompt_mask is not None:
             gate = gate * prompt_mask.to(gate.dtype).unsqueeze(-1)
-        fused = token_states + gate * projected_features
+        fused = token_states + gate * normalized_features
         if return_gate:
             return fused, gate
         return fused
@@ -171,8 +214,13 @@ if __name__ == "__main__":
     torch.manual_seed(7)
 
     batch, seq_len, dist_dim, hidden_dim = 2, 12, 45, 128
-    projector = EntityDistProjector(dist_dim=dist_dim, hidden_dim=hidden_dim)
-    gate = GatedFusion(hidden_dim=hidden_dim)
+    projector = EntityDistProjector(
+        dist_dim=dist_dim,
+        hidden_dim=hidden_dim,
+        bottleneck_dim=32,
+        use_temperature_scaling=True,
+    )
+    gate = GatedFusion(hidden_dim=hidden_dim, normalize_projected=True)
     corrector = LateCorrectionTransformer(
         hidden_dim=hidden_dim,
         bottleneck_dim=32,
@@ -186,8 +234,12 @@ if __name__ == "__main__":
     prompt_mask[:, :8] = True
 
     projected = projector(dist_vectors)
-    fused, gate_values = gate(hidden_states, projected, prompt_mask=prompt_mask, return_gate=True)
-    corrected, corrector_gate = corrector(fused, prompt_mask=prompt_mask, return_gate=True)
+    fused, gate_values = gate(
+        hidden_states, projected, prompt_mask=prompt_mask, return_gate=True
+    )
+    corrected, corrector_gate = corrector(
+        fused, prompt_mask=prompt_mask, return_gate=True
+    )
 
     assert projected.shape == (batch, seq_len, hidden_dim)
     assert fused.shape == hidden_states.shape
@@ -195,13 +247,22 @@ if __name__ == "__main__":
     assert gate_values.mean().item() > 0.0
     assert 0.05 < torch.sigmoid(gate.gate_net.bias).mean().item() < 0.25
     assert 0.05 < corrector_gate.mean().item() < 0.25
+    assert torch.exp(projector.log_temperature).item() == 1.0
 
     loss = corrected.square().mean()
     loss.backward()
     grad_checks = {
-        "projector": all(p.grad is not None and p.grad.abs().sum() > 0 for p in projector.parameters()),
-        "gate": all(p.grad is not None and p.grad.abs().sum() > 0 for p in gate.parameters()),
-        "corrector": all(p.grad is not None and p.grad.abs().sum() > 0 for p in corrector.parameters()),
+        "projector": all(
+            p.grad is not None and p.grad.abs().sum() > 0
+            for p in projector.parameters()
+        ),
+        "gate": all(
+            p.grad is not None and p.grad.abs().sum() > 0 for p in gate.parameters()
+        ),
+        "corrector": all(
+            p.grad is not None and p.grad.abs().sum() > 0
+            for p in corrector.parameters()
+        ),
     }
     print("Gradient flow:", grad_checks)
     assert all(grad_checks.values())
