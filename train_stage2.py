@@ -433,9 +433,9 @@ def main() -> None:
     model = get_peft_model(model, lora_config)
     _set_stage2_trainable_params(model)
 
-    gradient_checkpoint_fn = getattr(model, "gradient_checkpointing_enable", None)
-    if callable(gradient_checkpoint_fn):
-        gradient_checkpoint_fn()
+    # Keep gradient checkpointing disabled because EDEF is injected through a
+    # forward hook, and checkpoint recomputation must exactly match the
+    # original forward pass.
     config = getattr(model, "config", None)
     if config is not None and hasattr(config, "use_cache"):
         setattr(config, "use_cache", False)

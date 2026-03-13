@@ -172,7 +172,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_length", type=int, default=4096)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--grad_accum", type=int, default=8)
-    parser.add_argument("--epochs", type=float, default=3.0)
+    parser.add_argument("--epochs", type=float, default=2.0)
     parser.add_argument(
         "--lr", type=float, default=1e-3, help="Alias for --projector_lr"
     )
@@ -297,9 +297,9 @@ def main() -> None:
     for param in host.fusion_gate.parameters():
         param.requires_grad = True
 
-    gradient_checkpoint_fn = getattr(model, "gradient_checkpointing_enable", None)
-    if callable(gradient_checkpoint_fn):
-        gradient_checkpoint_fn()
+    # Keep gradient checkpointing disabled because EDEF is injected through a
+    # forward hook, and checkpoint recomputation must exactly match the
+    # original forward pass.
     if hasattr(model, "config") and hasattr(model.config, "use_cache"):
         model.config.use_cache = False
 
