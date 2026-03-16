@@ -13,7 +13,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 if __package__:
     _dist_mod = importlib.import_module(".distribution_alignment", package=__package__)
     _edef_mod = importlib.import_module(".edef_model", package=__package__)
-    _dataset_utils_mod = importlib.import_module(".ner_dataset_utils", package=__package__)
+    _dataset_utils_mod = importlib.import_module(
+        ".ner_dataset_utils", package=__package__
+    )
 else:
     _dist_mod = importlib.import_module("distribution_alignment")
     _edef_mod = importlib.import_module("edef_model")
@@ -25,42 +27,24 @@ attach_edef_to_model = _edef_mod.attach_edef_to_model
 load_edef_checkpoint = _edef_mod.load_edef_checkpoint
 DEFAULT_DIST_PATH = _dataset_utils_mod.DEFAULT_DIST_PATH
 DEFAULT_PHASE1_MODEL_PATH = _dataset_utils_mod.DEFAULT_PHASE1_MODEL_PATH
+NER_ROOT_END = _dataset_utils_mod.NER_ROOT_END
 load_task_metadata_from_dist_path = _dataset_utils_mod.load_task_metadata_from_dist_path
+parse_output_payload = _dataset_utils_mod.parse_output_payload
 
 
-def parse_ner_output(text):
-    """Parse model output to extract NER entities."""
-    import ast
-    import json
-    import re
-
-    cleaned = re.sub(r"^assistant\s*", "", text.strip(), flags=re.IGNORECASE)
-
-    try:
-        data = json.loads(cleaned)
-        return data
-    except json.JSONDecodeError:
-        pass
-
-    try:
-        data = ast.literal_eval(cleaned)
-        if isinstance(data, dict):
-            return data
-    except (ValueError, SyntaxError):
-        pass
-
-    match = re.search(r"\{.*['\"]ner['\"].*\}", cleaned, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group())
-        except json.JSONDecodeError:
-            try:
-                data = ast.literal_eval(match.group())
-                if isinstance(data, dict):
-                    return data
-            except (ValueError, SyntaxError):
-                pass
-    return {"ner": []}
+def parse_ner_output(
+    text: str, source_text: str | None = None
+) -> dict[str, list[list[str]]]:
+    """Parse model output into the historical {"ner": [[text, type], ...]} shape."""
+    entities = parse_output_payload(text, source_text=source_text)
+    return {
+        "ner": [
+            [str(entity.get("text", "")).strip(), str(entity.get("type", "")).strip()]
+            for entity in entities
+            if str(entity.get("text", "")).strip()
+            and str(entity.get("type", "")).strip()
+        ]
+    }
 
 
 def _find_edef_host(model: Any) -> Any:
@@ -172,19 +156,33 @@ class EDEFInferencePipeline:
             trust_remote_code=trust_remote_code,
         )
 
-        hidden = hidden_dim if hidden_dim is not None else getattr(model.config, "hidden_size", 2560)
-        model = attach_edef_to_model(model, dist_dim=effective_dist_dim, hidden_dim=hidden)
+        hidden = (
+            hidden_dim
+            if hidden_dim is not None
+            else getattr(model.config, "hidden_size", 2560)
+        )
+        model = attach_edef_to_model(
+            model, dist_dim=effective_dist_dim, hidden_dim=hidden
+        )
         model = PeftModel.from_pretrained(model, model_path)
 
         edef_ckpt = os.path.join(model_path, "edef_checkpoint")
         if os.path.isdir(edef_ckpt):
             host = _find_edef_host(model)
             if host is None:
-                raise RuntimeError("EDEF modules are not attached after loading LoRA adapter.")
+                raise RuntimeError(
+                    "EDEF modules are not attached after loading LoRA adapter."
+                )
             load_edef_checkpoint(host, edef_ckpt)
 
-        tokenizer_source = model_path if os.path.exists(os.path.join(model_path, "tokenizer_config.json")) else model_source
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, trust_remote_code=trust_remote_code)
+        tokenizer_source = (
+            model_path
+            if os.path.exists(os.path.join(model_path, "tokenizer_config.json"))
+            else model_source
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_source, trust_remote_code=trust_remote_code
+        )
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
@@ -201,7 +199,9 @@ class EDEFInferencePipeline:
             dist_dim=effective_dist_dim,
         )
 
-    def _build_fused_embeddings(self, prompt_text: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _build_fused_embeddings(
+        self, prompt_text: str
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         encoding = self.tokenizer(
             prompt_text,
             return_tensors="pt",
@@ -220,7 +220,9 @@ class EDEFInferencePipeline:
             default_dist=self.default_dist,
             dist_dim=self.dist_dim,
         )
-        dist_vectors = dist_vectors.to(device=token_embeds.device, dtype=token_embeds.dtype)
+        dist_vectors = dist_vectors.to(
+            device=token_embeds.device, dtype=token_embeds.dtype
+        )
         dist_vectors = dist_vectors.unsqueeze(0)
 
         seq_len = token_embeds.shape[1]
@@ -243,7 +245,9 @@ class EDEFInferencePipeline:
         prompt_text = _build_chat_prompt(self.tokenizer, self.instruction, text)
 
         with torch.no_grad():
-            input_ids, attention_mask, fused_embeds = self._build_fused_embeddings(prompt_text)
+            input_ids, attention_mask, fused_embeds = self._build_fused_embeddings(
+                prompt_text
+            )
 
             do_sample = temperature > 0
             generate_kwargs: dict[str, Any] = {
@@ -256,17 +260,32 @@ class EDEFInferencePipeline:
             }
             if do_sample:
                 generate_kwargs["temperature"] = temperature
-
-            output_ids = self.model.generate(**generate_kwargs)
+            try:
+                output_ids = self.model.generate(
+                    **generate_kwargs,
+                    stop_strings=[NER_ROOT_END],
+                    tokenizer=self.tokenizer,
+                )
+            except TypeError:
+                output_ids = self.model.generate(**generate_kwargs)
 
         prompt_len = input_ids.shape[1]
         generated_ids = output_ids[0]
-        completion_ids = generated_ids[prompt_len:] if generated_ids.shape[0] > prompt_len else generated_ids
+        completion_ids = (
+            generated_ids[prompt_len:]
+            if generated_ids.shape[0] > prompt_len
+            else generated_ids
+        )
         decoded = self.tokenizer.decode(completion_ids, skip_special_tokens=True)
-        return parse_ner_output(decoded)
+        return parse_ner_output(decoded, source_text=text)
 
-    def predict_batch(self, texts, max_new_tokens: int = 2048, temperature: float = 0.0):
-        return [self.predict(text, max_new_tokens=max_new_tokens, temperature=temperature) for text in texts]
+    def predict_batch(
+        self, texts, max_new_tokens: int = 2048, temperature: float = 0.0
+    ):
+        return [
+            self.predict(text, max_new_tokens=max_new_tokens, temperature=temperature)
+            for text in texts
+        ]
 
 
 def _load_texts_from_json(input_file: str) -> list[str]:
@@ -274,7 +293,9 @@ def _load_texts_from_json(input_file: str) -> list[str]:
         data = json.load(f)
 
     if not isinstance(data, list):
-        raise ValueError("--input_file JSON must be a list of strings or list of {input: text} objects.")
+        raise ValueError(
+            "--input_file JSON must be a list of strings or list of {input: text} objects."
+        )
 
     texts: list[str] = []
     for item in data:
@@ -283,16 +304,28 @@ def _load_texts_from_json(input_file: str) -> list[str]:
         elif isinstance(item, dict) and "input" in item:
             texts.append(str(item["input"]))
         else:
-            raise ValueError("Invalid JSON entry. Expected string or object with an 'input' field.")
+            raise ValueError(
+                "Invalid JSON entry. Expected string or object with an 'input' field."
+            )
     return texts
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="EDEF-enhanced clinical NER inference")
-    parser.add_argument("--model_path", required=True, help="Stage 2 model path (LoRA + EDEF)")
-    parser.add_argument("--phase1_model", default=DEFAULT_PHASE1_MODEL_PATH, help="Phase 1 merged model path")
-    parser.add_argument("--base_model", default="Qwen/Qwen3-4B-Instruct", help="Base model name")
-    parser.add_argument("--dist_path", default=DEFAULT_DIST_PATH, help="Entity distributions JSON")
+    parser.add_argument(
+        "--model_path", required=True, help="Stage 2 model path (LoRA + EDEF)"
+    )
+    parser.add_argument(
+        "--phase1_model",
+        default=DEFAULT_PHASE1_MODEL_PATH,
+        help="Phase 1 merged model path",
+    )
+    parser.add_argument(
+        "--base_model", default="Qwen/Qwen3-4B-Instruct", help="Base model name"
+    )
+    parser.add_argument(
+        "--dist_path", default=DEFAULT_DIST_PATH, help="Entity distributions JSON"
+    )
 
     io_group = parser.add_mutually_exclusive_group(required=True)
     io_group.add_argument("--input", help="Single text to process")
@@ -302,8 +335,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_new_tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--device_map", default="auto")
-    parser.add_argument("--torch_dtype", default="auto", help="auto|bfloat16|float16|float32")
-    parser.add_argument("--trust_remote_code", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--torch_dtype", default="auto", help="auto|bfloat16|float16|float32"
+    )
+    parser.add_argument(
+        "--trust_remote_code", action=argparse.BooleanOptionalAction, default=True
+    )
     return parser
 
 

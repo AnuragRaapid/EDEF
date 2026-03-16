@@ -14,6 +14,7 @@ import numpy as np
 from ner_dataset_utils import (
     DEFAULT_ARTIFACT_DIR,
     DEFAULT_DATASET_NAME,
+    STRUCTURED_OUTPUT_FORMAT,
     build_ner_instruction,
     extract_entity_types_from_samples,
     load_ner_samples,
@@ -83,7 +84,7 @@ def _process_tokenized_sample(
         return False
 
     normalized_tokens = [_normalize_token(str(token)) for token in tokens]
-    token_labels = [o_idx] * len(normalized_tokens)
+    token_label_sets = [set() for _ in normalized_tokens]
 
     entities = sample.get("entities", [])
     if not isinstance(entities, list):
@@ -102,17 +103,21 @@ def _process_tokenized_sample(
             or not isinstance(token_start, int)
             or not isinstance(token_end, int)
             or token_start < 0
-            or token_end < token_start
-            or token_end >= len(normalized_tokens)
+            or token_end <= token_start
+            or token_end > len(normalized_tokens)
         ):
             return False
 
-        for pos in range(token_start, token_end + 1):
-            token_labels[pos] = type_idx
+        for pos in range(token_start, token_end):
+            token_label_sets[pos].add(type_idx)
 
-    for token, label_idx in zip(normalized_tokens, token_labels):
+    for token, label_set in zip(normalized_tokens, token_label_sets):
         if token:
-            word_entity_counts[token][label_idx] += 1.0
+            if label_set:
+                for label_idx in sorted(label_set):
+                    word_entity_counts[token][label_idx] += 1.0
+            else:
+                word_entity_counts[token][o_idx] += 1.0
 
     return True
 
@@ -142,7 +147,9 @@ def _process_word_fallback_sample(
         if type_idx is None:
             continue
 
-        entity_words = [_normalize_token(token) for token in str(entity.get("text", "")).split()]
+        entity_words = [
+            _normalize_token(token) for token in str(entity.get("text", "")).split()
+        ]
         entity_words = [word for word in entity_words if word]
         for word in entity_words:
             word_entity_counts[word][type_idx] += 1.0
@@ -168,7 +175,9 @@ def process_samples(
         if _process_tokenized_sample(sample, type_to_idx, o_idx, word_entity_counts):
             tokenized_samples += 1
         else:
-            _process_word_fallback_sample(sample, type_to_idx, o_idx, word_entity_counts)
+            _process_word_fallback_sample(
+                sample, type_to_idx, o_idx, word_entity_counts
+            )
             fallback_samples += 1
         processed += 1
 
@@ -196,7 +205,9 @@ def top_words_for_type(
     ]
 
 
-def build_distributions(word_entity_counts: dict[str, np.ndarray]) -> dict[str, list[float]]:
+def build_distributions(
+    word_entity_counts: dict[str, np.ndarray],
+) -> dict[str, list[float]]:
     word_entity_dist: dict[str, list[float]] = {}
     for word, counts in word_entity_counts.items():
         total = counts.sum()
@@ -229,7 +240,9 @@ def _load_label_samples(args: argparse.Namespace) -> list[dict[str, Any]]:
 
     all_samples: list[dict[str, Any]] = []
     for split_name in args.label_splits:
-        logging.info("Loading label inventory split '%s' from %s", split_name, args.data_source)
+        logging.info(
+            "Loading label inventory split '%s' from %s", split_name, args.data_source
+        )
         all_samples.extend(
             load_ner_samples(
                 args.data_source,
@@ -256,7 +269,9 @@ def _load_count_samples(args: argparse.Namespace) -> list[dict[str, Any]]:
 
 def main() -> None:
     args = parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s"
+    )
     start_time = time.time()
 
     label_samples = _load_label_samples(args)
@@ -285,7 +300,9 @@ def main() -> None:
 
     word_entity_dist = build_distributions(word_entity_counts)
     words_with_entity_signal = sum(
-        1 for probs in word_entity_dist.values() if int(np.argmax(np.asarray(probs))) != o_idx
+        1
+        for probs in word_entity_dist.values()
+        if int(np.argmax(np.asarray(probs))) != o_idx
     )
     total_unique_words = len(word_entity_dist)
     vocabulary_coverage = (
@@ -301,7 +318,9 @@ def main() -> None:
         if str(entity.get("type", "")).strip()
     )
     per_type_top10 = {
-        type_name: top_words_for_type(word_entity_dist, type_to_idx[type_name], top_k=10)
+        type_name: top_words_for_type(
+            word_entity_dist, type_to_idx[type_name], top_k=10
+        )
         for type_name in entity_types
     }
     prompt_instruction = build_ner_instruction(entity_types)
@@ -315,6 +334,7 @@ def main() -> None:
         "entity_type_counts": dict(entity_counts),
         "distribution_dim": dist_dim,
         "o_index": o_idx,
+        "output_format": STRUCTURED_OUTPUT_FORMAT,
         "prompt_instruction": prompt_instruction,
         "default_unknown_distribution": default_dist,
         "total_unique_words": total_unique_words,
@@ -349,7 +369,9 @@ def main() -> None:
     print(f"Fallback-path samples: {process_summary['fallback_samples']}")
     print(f"Entity types: {', '.join(entity_types)}")
 
-    print_sanity_checks(word_entity_dist, entity_types, type_to_idx, words_with_entity_signal)
+    print_sanity_checks(
+        word_entity_dist, entity_types, type_to_idx, words_with_entity_signal
+    )
 
 
 if __name__ == "__main__":

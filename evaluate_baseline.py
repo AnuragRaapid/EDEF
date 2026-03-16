@@ -19,25 +19,28 @@ from ner_dataset_utils import (
     DEFAULT_DATASET_NAME,
     DEFAULT_DIST_PATH,
     DEFAULT_PHASE1_MODEL_PATH,
+    NER_ROOT_END,
     build_ner_instruction,
     extract_entity_types_from_samples,
     load_ner_samples,
     load_task_metadata_from_dist_path,
+    parse_output_payload,
 )
 
 
-def parse_ner_json(ner_string: str) -> list[tuple[str, str]]:
-    try:
-        ner_string = ner_string.strip()
-        data = json.loads(ner_string)
-        if "ner" in data:
-            return [
-                (str(entity).lower().strip(), str(etype).lower().strip())
-                for entity, etype in data["ner"]
-            ]
-        return []
-    except (json.JSONDecodeError, TypeError, KeyError):
-        return []
+def parse_ner_json(
+    ner_string: str,
+    source_text: str | None = None,
+) -> list[tuple[str, str]]:
+    entities = parse_output_payload(ner_string, source_text=source_text)
+    return [
+        (
+            str(entity.get("text", "")).lower().strip(),
+            str(entity.get("type", "")).lower().strip(),
+        )
+        for entity in entities
+        if str(entity.get("text", "")).strip() and str(entity.get("type", "")).strip()
+    ]
 
 
 def tokenize(text: str) -> list[str]:
@@ -118,7 +121,11 @@ def relaxed_match(
 def calculate_metrics(tp: int, fp: int, fn: int) -> tuple[float, float, float]:
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if (precision + recall) > 0
+        else 0.0
+    )
     return precision, recall, f1
 
 
@@ -187,7 +194,9 @@ def resolve_dtype() -> torch.dtype:
     return torch.float32
 
 
-def load_model_and_tokenizer(model_path: str, adapter_path: str | None, base_model: str):
+def load_model_and_tokenizer(
+    model_path: str, adapter_path: str | None, base_model: str
+):
     dtype = resolve_dtype()
     tokenizer_source = model_path if os.path.exists(model_path) else base_model
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, trust_remote_code=True)
@@ -223,7 +232,9 @@ def build_prompt(tokenizer, instruction: str, text: str) -> str:
         {"role": "system", "content": instruction},
         {"role": "user", "content": text},
     ]
-    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    return tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
 
 
 def extract_ner_json_string(generated_text: str) -> str:
@@ -239,8 +250,8 @@ def extract_ner_json_string(generated_text: str) -> str:
     if text.startswith("json"):
         text = text[4:].strip()
 
-    if "{\"ner\"" in text:
-        start = text.find("{\"ner\"")
+    if '{"ner"' in text:
+        start = text.find('{"ner"')
         end = text.rfind("}")
         if start != -1 and end != -1 and end > start:
             return text[start : end + 1]
@@ -269,13 +280,24 @@ def generate_prediction(
 
     start = time.time()
     with torch.no_grad():
-        output_ids = model.generate(
-            **encoded,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-        )
+        try:
+            output_ids = model.generate(
+                **encoded,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                stop_strings=[NER_ROOT_END],
+                tokenizer=tokenizer,
+            )
+        except TypeError:
+            output_ids = model.generate(
+                **encoded,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+            )
     elapsed = time.time() - start
 
     input_len = encoded["input_ids"].shape[-1]
@@ -325,7 +347,9 @@ def main() -> None:
     if os.path.exists(args.dist_path):
         instruction = load_task_metadata_from_dist_path(args.dist_path)["instruction"]
     else:
-        instruction = build_ner_instruction(extract_entity_types_from_samples(test_samples))
+        instruction = build_ner_instruction(
+            extract_entity_types_from_samples(test_samples)
+        )
 
     model, tokenizer = load_model_and_tokenizer(
         model_path=args.model_path,
@@ -353,8 +377,8 @@ def main() -> None:
 
         pred_json_text = extract_ner_json_string(generated_text)
 
-        pred_entities = parse_ner_json(pred_json_text)
-        gold_entities = parse_ner_json(gold_output)
+        pred_entities = parse_ner_json(pred_json_text, source_text=input_text)
+        gold_entities = parse_ner_json(gold_output, source_text=input_text)
 
         predictions.append(pred_entities)
         golds.append(gold_entities)
