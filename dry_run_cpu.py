@@ -40,15 +40,16 @@ def report(name: str, ok: bool, detail: str = ""):
 
 
 def section(title: str):
-    print(f"\n{'='*70}")
+    print(f"\n{'=' * 70}")
     print(f"  {title}")
-    print(f"{'='*70}")
+    print(f"{'=' * 70}")
 
 
 def flush_memory():
     gc.collect()
     try:
         import torch
+
         if hasattr(torch, "cuda") and torch.cuda.is_available():
             torch.cuda.empty_cache()
     except Exception:
@@ -59,19 +60,22 @@ def flush_memory():
 #  Phase 1: File & Data Verification (no model loading)
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 def test_phase1_files():
     section("Phase 1: File & Data Verification")
 
     # Check checkpoint exists
-    report("Phase 1 checkpoint dir exists",
-           os.path.isdir(PHASE1_MODEL),
-           PHASE1_MODEL)
+    report("Phase 1 checkpoint dir exists", os.path.isdir(PHASE1_MODEL), PHASE1_MODEL)
 
     # Check model files
-    safetensor_files = [f for f in os.listdir(PHASE1_MODEL) if f.endswith(".safetensors")]
-    report("Safetensor model files present",
-           len(safetensor_files) >= 2,
-           f"Found {len(safetensor_files)} safetensor files")
+    safetensor_files = [
+        f for f in os.listdir(PHASE1_MODEL) if f.endswith(".safetensors")
+    ]
+    report(
+        "Safetensor model files present",
+        len(safetensor_files) >= 2,
+        f"Found {len(safetensor_files)} safetensor files",
+    )
 
     # Check tokenizer files
     tok_config = os.path.join(PHASE1_MODEL, "tokenizer_config.json")
@@ -83,26 +87,49 @@ def test_phase1_files():
     if os.path.isfile(config_path):
         with open(config_path) as f:
             config = json.load(f)
-        report("Hidden size = 2560", config.get("hidden_size") == 2560, f"got {config.get('hidden_size')}")
+        report(
+            "Hidden size = 2560",
+            config.get("hidden_size") == 2560,
+            f"got {config.get('hidden_size')}",
+        )
         report("Model type = qwen3", config.get("model_type") == "qwen3")
         report("Vocab size = 151936", config.get("vocab_size") == 151936)
 
     # Check entity distributions
-    report("entity_distributions.json exists",
-           os.path.isfile(DIST_PATH),
-           f"{os.path.getsize(DIST_PATH) / 1e6:.1f} MB" if os.path.isfile(DIST_PATH) else "MISSING")
+    report(
+        "entity_distributions.json exists",
+        os.path.isfile(DIST_PATH),
+        f"{os.path.getsize(DIST_PATH) / 1e6:.1f} MB"
+        if os.path.isfile(DIST_PATH)
+        else "MISSING",
+    )
+
+    report(
+        "medical_alignment.py exists",
+        os.path.isfile(os.path.join(os.path.dirname(__file__), "medical_alignment.py")),
+    )
+    report(
+        "compare_fusion_variants.py exists",
+        os.path.isfile(
+            os.path.join(os.path.dirname(__file__), "compare_fusion_variants.py")
+        ),
+    )
 
     # Check entity_type_index.json
     report("entity_type_index.json exists", os.path.isfile(TYPE_INDEX_PATH))
     if os.path.isfile(TYPE_INDEX_PATH):
         with open(TYPE_INDEX_PATH) as f:
             type_index = json.load(f)
-        report("45 entity types (44 + O)",
-               len(type_index) == 45,
-               f"got {len(type_index)}")
+        report(
+            "45 entity types (44 + O)", len(type_index) == 45, f"got {len(type_index)}"
+        )
 
     # Check training data
-    for label, path in [("Train data", TRAIN_DATA), ("Val data", VAL_DATA), ("Test data", TEST_DATA)]:
+    for label, path in [
+        ("Train data", TRAIN_DATA),
+        ("Val data", VAL_DATA),
+        ("Test data", TEST_DATA),
+    ]:
         exists = os.path.isfile(path)
         if exists:
             with open(path) as f:
@@ -116,53 +143,62 @@ def test_phase1_files():
 #  Phase 2: Module-Level Tests (lightweight, no model loading)
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 def test_phase2_modules():
     section("Phase 2: EDEF Module Tests (no model loading)")
 
     import torch
+
     from edef_modules import EntityDistProjector, GatedFusion
 
     # Test EntityDistProjector
     proj = EntityDistProjector(dist_dim=45, hidden_dim=2560)
     param_count = sum(p.numel() for p in proj.parameters())
-    report("EntityDistProjector created",
-           param_count > 0,
-           f"{param_count:,} params ({param_count/1e6:.2f}M)")
+    report(
+        "EntityDistProjector created",
+        param_count > 0,
+        f"{param_count:,} params ({param_count / 1e6:.2f}M)",
+    )
 
     x = torch.randn(2, 10, 45)  # batch=2, seq=10, dist_dim=45
     out = proj(x)
-    report("Projector forward OK",
-           out.shape == (2, 10, 2560),
-           f"in={x.shape} → out={out.shape}")
+    report(
+        "Projector forward OK",
+        out.shape == (2, 10, 2560),
+        f"in={x.shape} → out={out.shape}",
+    )
 
     # Test GatedFusion
     gate = GatedFusion(hidden_dim=2560)
     gate_params = sum(p.numel() for p in gate.parameters())
-    report("GatedFusion created",
-           gate_params > 0,
-           f"{gate_params:,} params ({gate_params/1e6:.2f}M)")
+    report(
+        "GatedFusion created",
+        gate_params > 0,
+        f"{gate_params:,} params ({gate_params / 1e6:.2f}M)",
+    )
 
     h = torch.randn(2, 10, 2560)
     p = torch.randn(2, 10, 2560)
     fused = gate(h, p)
-    report("GatedFusion forward OK",
-           fused.shape == h.shape,
-           f"output shape={fused.shape}")
+    report(
+        "GatedFusion forward OK", fused.shape == h.shape, f"output shape={fused.shape}"
+    )
 
     # Check gate init (bias = -2.0 → sigmoid ≈ 0.12)
     gate_bias = gate.gate_net.bias.data
     sigmoid_mean = torch.sigmoid(gate_bias).mean().item()
-    report("Gate init near-identity",
-           sigmoid_mean < 0.15,
-           f"sigmoid(bias) mean={sigmoid_mean:.4f}, expected ~0.12")
+    report(
+        "Gate init near-identity",
+        sigmoid_mean < 0.15,
+        f"sigmoid(bias) mean={sigmoid_mean:.4f}, expected ~0.12",
+    )
 
     # Gradient flow
     h.requires_grad_(True)
     fused = gate(h, p)
     loss = fused.sum()
     loss.backward()
-    report("Gradient flows through gate",
-           h.grad is not None and h.grad.abs().sum() > 0)
+    report("Gradient flows through gate", h.grad is not None and h.grad.abs().sum() > 0)
 
     del proj, gate, x, out, h, p, fused
     flush_memory()
@@ -172,69 +208,144 @@ def test_phase2_modules():
 #  Phase 3: Distribution Alignment Tests
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 def test_phase3_distribution_alignment():
     section("Phase 3: Distribution Alignment")
 
-    from distribution_alignment import load_distributions, get_token_distributions
     from transformers import AutoTokenizer
+
+    from distribution_alignment import get_token_distributions, load_distributions
 
     # Load distributions
     t0 = time.time()
     word_entity_dist, default_dist = load_distributions(DIST_PATH)
     elapsed = time.time() - t0
-    report("load_distributions() OK",
-           len(word_entity_dist) > 0,
-           f"{len(word_entity_dist):,} words loaded in {elapsed:.1f}s")
+    report(
+        "load_distributions() OK",
+        len(word_entity_dist) > 0,
+        f"{len(word_entity_dist):,} words loaded in {elapsed:.1f}s",
+    )
 
-    report("default_dist is 45-dim",
-           len(default_dist) == 45,
-           f"dim={len(default_dist)}")
+    report(
+        "default_dist is 45-dim", len(default_dist) == 45, f"dim={len(default_dist)}"
+    )
 
     # Spot-check known words
     if "pain" in word_entity_dist:
         pain_dist = word_entity_dist["pain"]
         max_idx = pain_dist.index(max(pain_dist))
-        report("'pain' distribution loaded",
-               max(pain_dist) > 0.5,
-               f"max prob={max(pain_dist):.3f} at idx {max_idx}")
+        report(
+            "'pain' distribution loaded",
+            max(pain_dist) > 0.5,
+            f"max prob={max(pain_dist):.3f} at idx {max_idx}",
+        )
 
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(PHASE1_MODEL, trust_remote_code=True)
-    report("Tokenizer loaded from checkpoint",
-           tokenizer.vocab_size == 151936,
-           f"vocab={tokenizer.vocab_size}")
+    report(
+        "Tokenizer loaded from checkpoint",
+        tokenizer.vocab_size == 151936,
+        f"vocab={tokenizer.vocab_size}",
+    )
 
     # Test get_token_distributions
     import torch
+
     dist_vectors = get_token_distributions(
         SAMPLE_TEXT, tokenizer, word_entity_dist, default_dist, dist_dim=45
     )
-    report("get_token_distributions() OK",
-           isinstance(dist_vectors, torch.Tensor),
-           f"shape={dist_vectors.shape}, dtype={dist_vectors.dtype}")
+    report(
+        "get_token_distributions() OK",
+        isinstance(dist_vectors, torch.Tensor),
+        f"shape={dist_vectors.shape}, dtype={dist_vectors.dtype}",
+    )
 
     tokens = tokenizer.encode(SAMPLE_TEXT, add_special_tokens=False)
-    report("Token count matches dist vector length",
-           dist_vectors.shape[0] == len(tokens),
-           f"tokens={len(tokens)}, vectors={dist_vectors.shape[0]}")
+    report(
+        "Token count matches dist vector length",
+        dist_vectors.shape[0] == len(tokens),
+        f"tokens={len(tokens)}, vectors={dist_vectors.shape[0]}",
+    )
 
-    report("Distributions sum to ~1.0",
-           (dist_vectors.sum(dim=-1) - 1.0).abs().max().item() < 0.01,
-           f"max deviation from 1.0: {(dist_vectors.sum(dim=-1) - 1.0).abs().max().item():.6f}")
+    report(
+        "Distributions sum to ~1.0",
+        (dist_vectors.sum(dim=-1) - 1.0).abs().max().item() < 0.01,
+        f"max deviation from 1.0: {(dist_vectors.sum(dim=-1) - 1.0).abs().max().item():.6f}",
+    )
 
     del word_entity_dist, default_dist, dist_vectors, tokenizer
     flush_memory()
+
+
+def test_phase3_medical_alignment():
+    section("Phase 3B: Medical Alignment")
+
+    from edef_data import _MockTokenizer
+    from medical_alignment import build_medical_alignment_features
+
+    prompt_tokenizer = _MockTokenizer()
+    medical_tokenizer = _MockTokenizer()
+    prompt = (
+        "<|im_start|>system\nExtract entities<|im_end|>\n"
+        "<|im_start|>user\nPatient has chest pain and fever<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
+    clinical = "Patient has chest pain and fever"
+
+    features = build_medical_alignment_features(
+        prompt_text=prompt,
+        clinical_text=clinical,
+        prompt_tokenizer=prompt_tokenizer,
+        medical_tokenizer=medical_tokenizer,
+        prompt_max_length=128,
+        chunk_size=6,
+        chunk_overlap=2,
+        max_prompt_medical_tokens=3,
+    )
+
+    required = {
+        "medical_chunk_input_ids",
+        "medical_chunk_attention_mask",
+        "medical_chunk_token_indices",
+        "medical_chunk_token_weights",
+        "prompt_medical_token_indices",
+        "prompt_medical_token_weights",
+        "medical_token_count",
+    }
+    report(
+        "Medical alignment keys present",
+        required.issubset(features.keys()),
+        f"keys={sorted(features.keys())}",
+    )
+    report(
+        "Medical chunk tensor rank",
+        features["medical_chunk_input_ids"].dim() == 2,
+        f"shape={tuple(features['medical_chunk_input_ids'].shape)}",
+    )
+    report(
+        "Prompt alignment tensor rank",
+        features["prompt_medical_token_indices"].dim() == 2,
+        f"shape={tuple(features['prompt_medical_token_indices'].shape)}",
+    )
+    report(
+        "Medical token count > 0",
+        int(features["medical_token_count"].item()) > 0,
+        f"count={int(features['medical_token_count'].item())}",
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Phase 4: Dataset & Collator Tests (uses tokenizer + data, no model)
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 def test_phase4_dataset():
     section("Phase 4: Dataset & Collator")
 
     from transformers import AutoTokenizer
-    from edef_data import build_edef_dataset, EDEFDataCollator
+
+    from edef_data import EDEFDataCollator, _MockTokenizer, build_edef_dataset
+    from ner_dataset_utils import load_task_metadata_from_dist_path
 
     tokenizer = AutoTokenizer.from_pretrained(PHASE1_MODEL, trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -253,46 +364,104 @@ def test_phase4_dataset():
 
     # Check dataset size (should load all but we test a subset)
     full_size = len(dataset)
-    report("build_edef_dataset() OK",
-           full_size > 0,
-           f"{full_size} samples built in {elapsed:.1f}s")
+    report(
+        "build_edef_dataset() OK",
+        full_size > 0,
+        f"{full_size} samples built in {elapsed:.1f}s",
+    )
 
     # Check a sample
     sample = dataset[0]
     required_keys = {"input_ids", "attention_mask", "labels", "entity_dist_vectors"}
     has_keys = required_keys.issubset(set(sample.keys()))
-    report("Sample has required keys",
-           has_keys,
-           f"keys={list(sample.keys())}")
+    report("Sample has required keys", has_keys, f"keys={list(sample.keys())}")
 
     import torch
+
     if has_keys:
-        report("input_ids is tensor",
-               isinstance(sample["input_ids"], torch.Tensor),
-               f"shape={sample['input_ids'].shape}")
-        report("entity_dist_vectors shape",
-               sample["entity_dist_vectors"].shape[-1] == 45,
-               f"shape={sample['entity_dist_vectors'].shape}")
-        report("Labels have masking (-100)",
-               (sample["labels"] == -100).any().item(),
-               f"masked={int((sample['labels'] == -100).sum())}/{len(sample['labels'])}")
+        report(
+            "input_ids is tensor",
+            isinstance(sample["input_ids"], torch.Tensor),
+            f"shape={sample['input_ids'].shape}",
+        )
+        report(
+            "entity_dist_vectors shape",
+            sample["entity_dist_vectors"].shape[-1] == 45,
+            f"shape={sample['entity_dist_vectors'].shape}",
+        )
+        report(
+            "Labels have masking (-100)",
+            (sample["labels"] == -100).any().item(),
+            f"masked={int((sample['labels'] == -100).sum())}/{len(sample['labels'])}",
+        )
 
     # Test collator
     collator = EDEFDataCollator(tokenizer=tokenizer, max_length=512)
     batch = collator([dataset[0], dataset[1]])
-    report("EDEFDataCollator produces batch",
-           "input_ids" in batch and "entity_dist_vectors" in batch,
-           f"batch keys={list(batch.keys())}")
+    report(
+        "EDEFDataCollator produces batch",
+        "input_ids" in batch and "entity_dist_vectors" in batch,
+        f"batch keys={list(batch.keys())}",
+    )
 
     if "input_ids" in batch:
-        report("Batch shapes consistent",
-               batch["input_ids"].shape[0] == 2,
-               f"batch_size={batch['input_ids'].shape[0]}, seq={batch['input_ids'].shape[1]}")
+        report(
+            "Batch shapes consistent",
+            batch["input_ids"].shape[0] == 2,
+            f"batch_size={batch['input_ids'].shape[0]}, seq={batch['input_ids'].shape[1]}",
+        )
 
     if "entity_dist_vectors" in batch:
-        report("Dist vectors in batch",
-               batch["entity_dist_vectors"].shape[0] == 2 and batch["entity_dist_vectors"].shape[-1] == 45,
-               f"shape={batch['entity_dist_vectors'].shape}")
+        report(
+            "Dist vectors in batch",
+            batch["entity_dist_vectors"].shape[0] == 2
+            and batch["entity_dist_vectors"].shape[-1] == 45,
+            f"shape={batch['entity_dist_vectors'].shape}",
+        )
+
+    # Medical-mode dataset smoke test with mock medical tokenizer
+    task_metadata = load_task_metadata_from_dist_path(DIST_PATH)
+    medical_dataset = build_edef_dataset(
+        data_path=TRAIN_DATA,
+        tokenizer=tokenizer,
+        dist_path=DIST_PATH,
+        signal_source="medical_encoder",
+        medical_tokenizer=_MockTokenizer(),
+        max_length=256,
+        medical_chunk_size=12,
+        medical_chunk_overlap=4,
+        max_prompt_medical_tokens=3,
+        instruction=str(task_metadata["instruction"]),
+    )
+    med_sample = medical_dataset[0]
+    med_required = {
+        "medical_chunk_input_ids",
+        "medical_chunk_attention_mask",
+        "medical_chunk_token_indices",
+        "medical_chunk_token_weights",
+        "prompt_medical_token_indices",
+        "prompt_medical_token_weights",
+        "medical_token_count",
+    }
+    report(
+        "Medical sample has required keys",
+        med_required.issubset(set(med_sample.keys())),
+        f"keys={list(med_sample.keys())}",
+    )
+
+    med_batch = collator([medical_dataset[0], medical_dataset[1]])
+    report(
+        "Medical collator produces batch",
+        "medical_chunk_input_ids" in med_batch
+        and "prompt_medical_token_indices" in med_batch,
+        f"batch keys={list(med_batch.keys())}",
+    )
+    if "medical_chunk_input_ids" in med_batch:
+        report(
+            "Medical chunk batch shape",
+            med_batch["medical_chunk_input_ids"].shape[0] == 2,
+            f"shape={med_batch['medical_chunk_input_ids'].shape}",
+        )
 
     del dataset, collator, batch, tokenizer
     flush_memory()
@@ -302,12 +471,18 @@ def test_phase4_dataset():
 #  Phase 5: Full Model Loading + EDEF Attach (heavy — needs ~8GB)
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 def test_phase5_model_loading():
     section("Phase 5: Model Loading + EDEF Attach")
 
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
-    from edef_model import attach_edef_to_model, save_edef_checkpoint, load_edef_checkpoint
+
+    from edef_model import (
+        attach_edef_to_model,
+        load_edef_checkpoint,
+        save_edef_checkpoint,
+    )
 
     # Load model in bf16 to save memory
     print("  ⏳ Loading Qwen3-4B on CPU (bf16, ~8GB)...")
@@ -319,33 +494,34 @@ def test_phase5_model_loading():
         low_cpu_mem_usage=True,
     )
     elapsed = time.time() - t0
-    report("Model loaded on CPU",
-           model is not None,
-           f"in {elapsed:.1f}s")
+    report("Model loaded on CPU", model is not None, f"in {elapsed:.1f}s")
 
     total_params = sum(p.numel() for p in model.parameters())
-    report("Model param count",
-           total_params > 3e9,
-           f"{total_params:,} ({total_params/1e9:.2f}B)")
+    report(
+        "Model param count",
+        total_params > 3e9,
+        f"{total_params:,} ({total_params / 1e9:.2f}B)",
+    )
 
     # Check embedding layer
     embed = model.model.embed_tokens
-    report("embed_tokens accessible",
-           embed is not None,
-           f"shape={embed.weight.shape}")
+    report("embed_tokens accessible", embed is not None, f"shape={embed.weight.shape}")
 
     # Attach EDEF
     model = attach_edef_to_model(model, dist_dim=45, hidden_dim=2560)
-    report("attach_edef_to_model() OK",
-           hasattr(model, "entity_projector") and hasattr(model, "fusion_gate"))
-
-    edef_params = (
-        sum(p.numel() for p in model.entity_projector.parameters()) +
-        sum(p.numel() for p in model.fusion_gate.parameters())
+    report(
+        "attach_edef_to_model() OK",
+        hasattr(model, "entity_projector") and hasattr(model, "fusion_gate"),
     )
-    report("EDEF params count",
-           edef_params > 19e6,
-           f"{edef_params:,} ({edef_params/1e6:.2f}M)")
+
+    edef_params = sum(p.numel() for p in model.entity_projector.parameters()) + sum(
+        p.numel() for p in model.fusion_gate.parameters()
+    )
+    report(
+        "EDEF params count",
+        edef_params > 19e6,
+        f"{edef_params:,} ({edef_params / 1e6:.2f}M)",
+    )
 
     # Test forward with entity_dist_vectors
     tokenizer = AutoTokenizer.from_pretrained(PHASE1_MODEL, trust_remote_code=True)
@@ -363,9 +539,11 @@ def test_phase5_model_loading():
             attention_mask=inputs["attention_mask"],
             entity_dist_vectors=dist_v,
         )
-    report("Forward with entity_dist_vectors OK",
-           hasattr(outputs, "logits"),
-           f"logits shape={outputs.logits.shape}")
+    report(
+        "Forward with entity_dist_vectors OK",
+        hasattr(outputs, "logits"),
+        f"logits shape={outputs.logits.shape}",
+    )
 
     # Test forward WITHOUT entity_dist_vectors (should still work)
     with torch.no_grad():
@@ -373,18 +551,18 @@ def test_phase5_model_loading():
             input_ids=inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
         )
-    report("Forward WITHOUT entity_dist_vectors OK",
-           hasattr(outputs_no_edef, "logits"))
+    report("Forward WITHOUT entity_dist_vectors OK", hasattr(outputs_no_edef, "logits"))
 
     # Test save/load checkpoint
     import tempfile
+
     with tempfile.TemporaryDirectory() as tmpdir:
         ckpt_path = os.path.join(tmpdir, "edef_ckpt")
         save_edef_checkpoint(model, ckpt_path)
         saved_files = os.listdir(ckpt_path)
-        report("save_edef_checkpoint() OK",
-               len(saved_files) >= 2,
-               f"files={saved_files}")
+        report(
+            "save_edef_checkpoint() OK", len(saved_files) >= 2, f"files={saved_files}"
+        )
 
         # Load back
         load_edef_checkpoint(model, ckpt_path)
@@ -406,8 +584,7 @@ def test_phase5_model_loading():
     )
     peft_model = get_peft_model(model, lora_config)
     peft_model.print_trainable_parameters()
-    report("PEFT get_peft_model() with EDEF OK",
-           peft_model is not None)
+    report("PEFT get_peft_model() with EDEF OK", peft_model is not None)
 
     # Test PEFT forward
     with torch.no_grad():
@@ -416,9 +593,11 @@ def test_phase5_model_loading():
             attention_mask=inputs["attention_mask"],
             entity_dist_vectors=dist_v,
         )
-    report("PEFT forward with entity_dist_vectors OK",
-           hasattr(peft_out, "logits"),
-           f"logits shape={peft_out.logits.shape}")
+    report(
+        "PEFT forward with entity_dist_vectors OK",
+        hasattr(peft_out, "logits"),
+        f"logits shape={peft_out.logits.shape}",
+    )
 
     # Cleanup to free memory
     del peft_model, model, tokenizer, outputs, outputs_no_edef
@@ -430,18 +609,22 @@ def test_phase5_model_loading():
 #  Phase 6: Training Dry-Run (1 step each)
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 def test_phase6_training():
     section("Phase 6: Training Script Dry-Runs")
 
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
+
+    from edef_data import EDEFDataCollator, build_edef_dataset
     from edef_model import attach_edef_to_model, save_edef_checkpoint
-    from edef_data import build_edef_dataset, EDEFDataCollator
 
     # Import the trainers
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from train_stage1 import EDEFTrainer as S1Trainer, GateLoggingCallback as S1GateCallback
-    from train_stage2 import EDEFTrainer as S2Trainer, GateLoggingCallback as S2GateCallback
+    from train_stage1 import EDEFTrainer as S1Trainer
+    from train_stage1 import GateLoggingCallback as S1GateCallback
+    from train_stage2 import EDEFTrainer as S2Trainer
+    from train_stage2 import GateLoggingCallback as S2GateCallback
 
     report("train_stage1.py imports OK", True)
     report("train_stage2.py imports OK", True)
@@ -473,9 +656,11 @@ def test_phase6_training():
         param.requires_grad = True
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    report("Stage 1: Only EDEF trainable",
-           trainable < 25e6,
-           f"{trainable:,} trainable params")
+    report(
+        "Stage 1: Only EDEF trainable",
+        trainable < 25e6,
+        f"{trainable:,} trainable params",
+    )
 
     # Build tiny dataset
     dataset = build_edef_dataset(
@@ -490,6 +675,7 @@ def test_phase6_training():
     collator = EDEFDataCollator(tokenizer=tokenizer, max_length=128)
 
     import tempfile
+
     with tempfile.TemporaryDirectory() as tmpdir:
         training_args = TrainingArguments(
             output_dir=tmpdir,
@@ -526,8 +712,10 @@ def test_phase6_training():
         # Save EDEF checkpoint
         ckpt_path = os.path.join(tmpdir, "edef_ckpt")
         save_edef_checkpoint(model, ckpt_path)
-        report("Stage 1 EDEF checkpoint saved",
-               os.path.isdir(ckpt_path) and len(os.listdir(ckpt_path)) >= 2)
+        report(
+            "Stage 1 EDEF checkpoint saved",
+            os.path.isdir(ckpt_path) and len(os.listdir(ckpt_path)) >= 2,
+        )
 
     # ── Stage 2 dry-run ──
     print("  ⏳ Stage 2 dry-run: LoRA + EDEF joint training...")
@@ -548,9 +736,11 @@ def test_phase6_training():
     peft_model = get_peft_model(model, lora_config)
 
     peft_trainable = sum(p.numel() for p in peft_model.parameters() if p.requires_grad)
-    report("Stage 2: LoRA + EDEF trainable",
-           peft_trainable > trainable,
-           f"{peft_trainable:,} trainable params")
+    report(
+        "Stage 2: LoRA + EDEF trainable",
+        peft_trainable > trainable,
+        f"{peft_trainable:,} trainable params",
+    )
 
     with tempfile.TemporaryDirectory() as tmpdir:
         training_args = TrainingArguments(
@@ -594,13 +784,15 @@ def test_phase6_training():
 #  Phase 7: Inference Dry-Run
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 def test_phase7_inference():
     section("Phase 7: Inference & Generation Dry-Run")
 
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    from distribution_alignment import get_token_distributions, load_distributions
     from edef_model import attach_edef_to_model
-    from distribution_alignment import load_distributions, get_token_distributions
 
     # Load model
     print("  ⏳ Loading model for inference dry-run...")
@@ -631,8 +823,12 @@ def test_phase7_inference():
         {"role": "system", "content": NER_INSTRUCTION},
         {"role": "user", "content": SAMPLE_TEXT},
     ]
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    report("Chat template applied", len(prompt) > 0, f"prompt length={len(prompt)} chars")
+    prompt = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    report(
+        "Chat template applied", len(prompt) > 0, f"prompt length={len(prompt)} chars"
+    )
 
     # Tokenize
     encoding = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
@@ -641,10 +837,15 @@ def test_phase7_inference():
     report("Tokenized prompt", True, f"tokens={input_ids.shape[1]}")
 
     # Build distribution vectors
-    dist_vectors = get_token_distributions(prompt, tokenizer, word_entity_dist, default_dist, dist_dim=45)
+    dist_vectors = get_token_distributions(
+        prompt, tokenizer, word_entity_dist, default_dist, dist_dim=45
+    )
     dist_vectors = dist_vectors.unsqueeze(0).to(dtype=torch.bfloat16)
-    report("Distribution vectors built", dist_vectors.shape[1] == input_ids.shape[1],
-           f"shape={dist_vectors.shape}")
+    report(
+        "Distribution vectors built",
+        dist_vectors.shape[1] == input_ids.shape[1],
+        f"shape={dist_vectors.shape}",
+    )
 
     # Test fused embeddings approach (same as inference/eval scripts)
     with torch.no_grad():
@@ -655,9 +856,11 @@ def test_phase7_inference():
         # Project + fuse
         projected = model.entity_projector(dist_vectors)
         fused = model.fusion_gate(inputs_embeds, projected)
-        report("Fused embeddings computed",
-               fused.shape == inputs_embeds.shape,
-               f"shape={fused.shape}")
+        report(
+            "Fused embeddings computed",
+            fused.shape == inputs_embeds.shape,
+            f"shape={fused.shape}",
+        )
 
         # Generate with fused embeddings (just 5 tokens for speed)
         print("  ⏳ Generating (5 tokens, CPU — slow is normal)...")
@@ -670,23 +873,34 @@ def test_phase7_inference():
             pad_token_id=tokenizer.pad_token_id,
         )
         elapsed = time.time() - t0
-        generated = tokenizer.decode(output_ids[0][input_ids.shape[1]:], skip_special_tokens=True)
-        report("model.generate() with fused embeddings OK",
-               len(output_ids[0]) > input_ids.shape[1],
-               f"generated '{generated[:50]}...' in {elapsed:.1f}s")
+        generated = tokenizer.decode(
+            output_ids[0][input_ids.shape[1] :], skip_special_tokens=True
+        )
+        report(
+            "model.generate() with fused embeddings OK",
+            len(output_ids[0]) > input_ids.shape[1],
+            f"generated '{generated[:50]}...' in {elapsed:.1f}s",
+        )
 
     # Test edef_inference.py module import
     from edef_inference import parse_ner_output
+
     result = parse_ner_output('{"ner": [["chest pain", "Sign_Symptom"]]}')
-    report("parse_ner_output() OK",
-           result.get("ner") == [["chest pain", "Sign_Symptom"]])
+    report(
+        "parse_ner_output() OK", result.get("ner") == [["chest pain", "Sign_Symptom"]]
+    )
 
     # Test evaluate_baseline.py module import
-    from evaluate_baseline import parse_ner_json, exact_match, relaxed_match, calculate_metrics
-    entities = parse_ner_json('{"ner": [["chest pain", "Sign_Symptom"], ["aspirin", "Drug"]]}')
-    report("evaluate_baseline.parse_ner_json() OK",
-           len(entities) == 2,
-           f"parsed {len(entities)} entities")
+    from evaluate_baseline import calculate_metrics, exact_match, parse_ner_json
+
+    entities = parse_ner_json(
+        '{"ner": [["chest pain", "Sign_Symptom"], ["aspirin", "Drug"]]}'
+    )
+    report(
+        "evaluate_baseline.parse_ner_json() OK",
+        len(entities) == 2,
+        f"parsed {len(entities)} entities",
+    )
 
     tp, fp, fn = exact_match(entities, entities)
     report("exact_match() OK", tp == 2 and fp == 0 and fn == 0)
@@ -696,9 +910,9 @@ def test_phase7_inference():
 
     # Test evaluate_edef.py module import
     from evaluate_edef import _aggregate_metrics
+
     metrics = _aggregate_metrics([entities], [entities])
-    report("evaluate_edef._aggregate_metrics() OK",
-           metrics["exact"]["f1"] == 1.0)
+    report("evaluate_edef._aggregate_metrics() OK", metrics["exact"]["f1"] == 1.0)
 
     del model, tokenizer, word_entity_dist
     flush_memory()
@@ -708,6 +922,7 @@ def test_phase7_inference():
 # ═══════════════════════════════════════════════════════════════════════════
 #  Main
 # ═══════════════════════════════════════════════════════════════════════════
+
 
 def main():
     print("\n" + "🔬" * 35)
@@ -719,43 +934,49 @@ def main():
     # Phase 1: Files
     try:
         test_phase1_files()
-    except Exception as e:
+    except Exception:
         report("Phase 1 CRASHED", False, traceback.format_exc())
 
     # Phase 2: Modules
     try:
         test_phase2_modules()
-    except Exception as e:
+    except Exception:
         report("Phase 2 CRASHED", False, traceback.format_exc())
 
     # Phase 3: Distribution alignment
     try:
         test_phase3_distribution_alignment()
-    except Exception as e:
+    except Exception:
         report("Phase 3 CRASHED", False, traceback.format_exc())
+
+    # Phase 3B: Medical alignment
+    try:
+        test_phase3_medical_alignment()
+    except Exception:
+        report("Phase 3B CRASHED", False, traceback.format_exc())
 
     # Phase 4: Dataset + collator
     try:
         test_phase4_dataset()
-    except Exception as e:
+    except Exception:
         report("Phase 4 CRASHED", False, traceback.format_exc())
 
     # Phase 5: Model + EDEF + PEFT
     try:
         test_phase5_model_loading()
-    except Exception as e:
+    except Exception:
         report("Phase 5 CRASHED", False, traceback.format_exc())
 
     # Phase 6: Training
     try:
         test_phase6_training()
-    except Exception as e:
+    except Exception:
         report("Phase 6 CRASHED", False, traceback.format_exc())
 
     # Phase 7: Inference
     try:
         test_phase7_inference()
-    except Exception as e:
+    except Exception:
         report("Phase 7 CRASHED", False, traceback.format_exc())
 
     total_time = time.time() - start
@@ -767,7 +988,7 @@ def main():
     print(f"  ⏱️  Total time: {total_time:.1f}s")
 
     if ERRORS:
-        print(f"\n  Failures:")
+        print("\n  Failures:")
         for name, detail in ERRORS:
             print(f"    ❌ {name}: {detail[:200]}")
 

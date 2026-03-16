@@ -1,8 +1,6 @@
-"""Stage 2 EDEF Training: Joint LoRA + EDEF.
+"""Stage 2 EDEF Training: Joint Qwen LoRA + side-signal training."""
 
-Trains LoRA adapters + EntityDistProjector + GatedFusion jointly.
-This is the main training stage where the model learns to leverage distribution features for NER.
-"""
+from __future__ import annotations
 
 import argparse
 import importlib
@@ -26,7 +24,16 @@ else:
 
 build_edef_dataset = _data_mod.build_edef_dataset
 EDEFDataCollator = _data_mod.EDEFDataCollator
+DEFAULT_MEDICAL_CHUNK_OVERLAP = _model_mod.DEFAULT_MEDICAL_CHUNK_OVERLAP
+DEFAULT_MEDICAL_CHUNK_SIZE = _model_mod.DEFAULT_MEDICAL_CHUNK_SIZE
+DEFAULT_MEDICAL_ENCODER_MODEL = _model_mod.DEFAULT_MEDICAL_ENCODER_MODEL
+DEFAULT_MEDICAL_LORA_TARGET_MODULES = _model_mod.DEFAULT_MEDICAL_LORA_TARGET_MODULES
+DEFAULT_MEDICAL_LORA_TOP_LAYERS = _model_mod.DEFAULT_MEDICAL_LORA_TOP_LAYERS
+DEFAULT_MAX_PROMPT_MEDICAL_TOKENS = _model_mod.DEFAULT_MAX_PROMPT_MEDICAL_TOKENS
+DEFAULT_SIGNAL_SOURCE = _model_mod.DEFAULT_SIGNAL_SOURCE
+apply_medical_encoder_lora = _model_mod.apply_medical_encoder_lora
 attach_edef_to_model = _model_mod.attach_edef_to_model
+get_edef_config = _model_mod.get_edef_config
 load_edef_checkpoint = _model_mod.load_edef_checkpoint
 save_edef_checkpoint = _model_mod.save_edef_checkpoint
 
@@ -59,7 +66,7 @@ class EDEFTrainer(Trainer):
         )
 
 
-def get_gate_module(model):
+def get_gate_module(model: Any):
     if hasattr(model, "fusion_gate"):
         return model.fusion_gate
     if hasattr(model, "base_model"):
@@ -69,7 +76,7 @@ def get_gate_module(model):
     return None
 
 
-def get_model_with_edef(model):
+def get_model_with_edef(model: Any):
     if hasattr(model, "entity_projector") and hasattr(model, "fusion_gate"):
         return model
     if hasattr(model, "base_model"):
@@ -83,6 +90,30 @@ def get_model_with_edef(model):
     return None
 
 
+def _parse_csv_modules(value: str) -> list[str]:
+    modules = [item.strip() for item in value.split(",") if item.strip()]
+    if not modules:
+        raise ValueError("At least one LoRA target module must be provided.")
+    return modules
+
+
+def _resolve_task_setup(args: argparse.Namespace) -> tuple[dict[str, Any], int, str]:
+    if args.signal_source == "distribution" and not args.dist_path:
+        raise ValueError("Distribution mode requires --dist_path.")
+
+    metadata: dict[str, Any] = {"entity_types": []}
+    dist_dim = 45
+    instruction = str(args.instruction or "").strip()
+    if args.dist_path:
+        metadata = load_task_metadata_from_dist_path(args.dist_path)
+        dist_dim = int(metadata["dist_dim"])
+        if not instruction:
+            instruction = str(metadata["instruction"])
+    if not instruction:
+        raise ValueError("Provide --instruction or --dist_path with task metadata.")
+    return metadata, dist_dim, instruction
+
+
 def patch_transformers_tf32() -> None:
     if not hasattr(torch.backends, "fp32_precision"):
         return
@@ -94,7 +125,6 @@ def patch_transformers_tf32() -> None:
 
     import transformers.training_args as hf_training_args
 
-    # TorchInductor still reads the legacy TF32 getter during torch.compile().
     def _legacy_enable_tf32(enable: bool) -> None:
         matmul_backend.allow_tf32 = enable
         cudnn_backend = getattr(torch.backends, "cudnn", None)
@@ -110,7 +140,7 @@ class GateLoggingCallback(TrainerCallback):
         self.log_every_steps = log_every_steps
 
     def on_step_end(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
-        del args, kwargs
+        del args, control, kwargs
         if state.global_step <= 0 or state.global_step % self.log_every_steps != 0:
             return None
 
@@ -130,13 +160,12 @@ class GateLoggingCallback(TrainerCallback):
                 + f"sigmoid mean={gate_sigmoid.mean().item():.4f}, "
                 + f"min={gate_sigmoid.min().item():.4f}, max={gate_sigmoid.max().item():.4f}"
             )
-
         return None
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Stage 2 EDEF training (LoRA + projector + gate)."
+        description="Stage 2 EDEF training (Qwen LoRA plus distribution or semantic medical fusion)."
     )
     parser.add_argument(
         "--phase1_model",
@@ -178,7 +207,46 @@ def parse_args():
         "--dist_path",
         type=str,
         default=DEFAULT_DIST_PATH,
-        help="Entity distribution file path.",
+        help="Entity distribution file path. Optional in medical mode if --instruction is provided.",
+    )
+    parser.add_argument("--instruction", type=str, default=None)
+    parser.add_argument(
+        "--signal_source",
+        type=str,
+        default=DEFAULT_SIGNAL_SOURCE,
+        choices=["distribution", "medical_encoder"],
+    )
+    parser.add_argument(
+        "--medical_encoder_model",
+        type=str,
+        default=DEFAULT_MEDICAL_ENCODER_MODEL,
+    )
+    parser.add_argument(
+        "--medical_chunk_size", type=int, default=DEFAULT_MEDICAL_CHUNK_SIZE
+    )
+    parser.add_argument(
+        "--medical_chunk_overlap", type=int, default=DEFAULT_MEDICAL_CHUNK_OVERLAP
+    )
+    parser.add_argument(
+        "--max_prompt_medical_tokens",
+        type=int,
+        default=DEFAULT_MAX_PROMPT_MEDICAL_TOKENS,
+    )
+    parser.add_argument("--medical_lora_r", type=int, default=8)
+    parser.add_argument("--medical_lora_alpha", type=int, default=16)
+    parser.add_argument(
+        "--medical_lora_target_modules",
+        type=str,
+        default=",".join(DEFAULT_MEDICAL_LORA_TARGET_MODULES),
+    )
+    parser.add_argument(
+        "--medical_lora_top_layers",
+        type=int,
+        default=DEFAULT_MEDICAL_LORA_TOP_LAYERS,
+    )
+    parser.add_argument("--medical_lora_dropout", type=float, default=0.0)
+    parser.add_argument(
+        "--medical_lora_use_dora", action=argparse.BooleanOptionalAction, default=False
     )
     parser.add_argument("--train_split", type=str, default="train")
     parser.add_argument("--val_split", type=str, default="validation")
@@ -201,12 +269,12 @@ def parse_args():
     parser.add_argument(
         "--skip_stage1",
         action="store_true",
-        help="Skip loading Stage 1 checkpoint and train EDEF modules from scratch.",
+        help="Skip loading Stage 1 checkpoint and start side-signal modules from scratch.",
     )
     return parser.parse_args()
 
 
-def load_phase1_model(args):
+def load_phase1_model(args: argparse.Namespace):
     if args.phase1_adapter:
         model: Any = AutoModelForCausalLM.from_pretrained(
             args.base_model,
@@ -228,27 +296,58 @@ def main():
     args = parse_args()
     torch.manual_seed(args.seed)
     patch_transformers_tf32()
-    task_metadata = load_task_metadata_from_dist_path(args.dist_path)
-    dist_dim = int(task_metadata["dist_dim"])
-    instruction = str(task_metadata["instruction"])
 
+    task_metadata, dist_dim, instruction = _resolve_task_setup(args)
     tokenizer_source = args.base_model if args.phase1_adapter else args.phase1_model
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
+    medical_tokenizer = None
+    if args.signal_source == "medical_encoder":
+        medical_tokenizer = AutoTokenizer.from_pretrained(
+            args.medical_encoder_model,
+            trust_remote_code=True,
+        )
+
     print("Loading Phase 1 model...")
     model = load_phase1_model(args)
 
-    hidden_dim = getattr(model.config, "hidden_size", 2560)
-    model = attach_edef_to_model(model, dist_dim=dist_dim, hidden_dim=hidden_dim)
+    hidden_dim = int(getattr(model.config, "hidden_size", 2560))
+    model = attach_edef_to_model(
+        model,
+        dist_dim=dist_dim,
+        hidden_dim=hidden_dim,
+        signal_source=args.signal_source,
+        medical_encoder_model_name=args.medical_encoder_model,
+        medical_chunk_size=args.medical_chunk_size,
+        medical_chunk_overlap=args.medical_chunk_overlap,
+        max_prompt_medical_tokens=args.max_prompt_medical_tokens,
+    )
 
+    loaded_stage1 = False
     if not args.skip_stage1 and os.path.exists(args.stage1_checkpoint):
-        load_edef_checkpoint(model, args.stage1_checkpoint)
+        load_edef_checkpoint(
+            model,
+            args.stage1_checkpoint,
+            medical_encoder_trainable=(args.signal_source == "medical_encoder"),
+        )
+        loaded_stage1 = True
         print(f"Loaded Stage 1 EDEF checkpoint from {args.stage1_checkpoint}")
     else:
-        print("Starting EDEF modules from scratch (no Stage 1 checkpoint)")
+        print("Starting side-signal modules from scratch (no Stage 1 checkpoint)")
+
+    if args.signal_source == "medical_encoder" and not loaded_stage1:
+        model = apply_medical_encoder_lora(
+            model,
+            r=args.medical_lora_r,
+            alpha=args.medical_lora_alpha,
+            target_modules=_parse_csv_modules(args.medical_lora_target_modules),
+            top_layers=args.medical_lora_top_layers,
+            dropout=args.medical_lora_dropout,
+            use_dora=args.medical_lora_use_dora,
+        )
 
     lora_config = LoraConfig(
         r=args.lora_r,
@@ -269,7 +368,6 @@ def main():
         task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, lora_config)
-
     original_peft_forward = model.forward
 
     def peft_edef_forward(*forward_args, **forward_kwargs):
@@ -285,17 +383,25 @@ def main():
         setattr(config, "use_cache", False)
 
     model.print_trainable_parameters()
-    print(
-        f"Loaded {len(task_metadata['entity_types'])} entity types: {task_metadata['entity_types']}"
-    )
+    print(f"Signal source: {args.signal_source}")
+    if task_metadata.get("entity_types"):
+        print(
+            f"Loaded {len(task_metadata['entity_types'])} entity types: {task_metadata['entity_types']}"
+        )
+    print(f"EDEF config: {get_edef_config(model)}")
 
     print("Building EDEF datasets...")
     train_dataset = build_edef_dataset(
         data_path=args.train_data,
         tokenizer=tokenizer,
         dist_path=args.dist_path,
+        signal_source=args.signal_source,
+        medical_tokenizer=medical_tokenizer,
         max_length=args.max_length,
         dist_dim=dist_dim,
+        medical_chunk_size=args.medical_chunk_size,
+        medical_chunk_overlap=args.medical_chunk_overlap,
+        max_prompt_medical_tokens=args.max_prompt_medical_tokens,
         dataset_split=args.train_split,
         dataset_revision=args.dataset_revision,
         cache_dir=args.cache_dir,
@@ -305,8 +411,13 @@ def main():
         data_path=args.val_data,
         tokenizer=tokenizer,
         dist_path=args.dist_path,
+        signal_source=args.signal_source,
+        medical_tokenizer=medical_tokenizer,
         max_length=args.max_length,
         dist_dim=dist_dim,
+        medical_chunk_size=args.medical_chunk_size,
+        medical_chunk_overlap=args.medical_chunk_overlap,
+        max_prompt_medical_tokens=args.max_prompt_medical_tokens,
         dataset_split=args.val_split,
         dataset_revision=args.dataset_revision,
         cache_dir=args.cache_dir,
@@ -315,7 +426,6 @@ def main():
     data_collator = EDEFDataCollator(tokenizer=tokenizer, max_length=args.max_length)
 
     os.makedirs(args.output_dir, exist_ok=True)
-
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.batch_size,
@@ -359,7 +469,6 @@ def main():
 
     model.save_pretrained(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
-
     base_with_edef = get_model_with_edef(model)
     if base_with_edef is None:
         raise RuntimeError(
