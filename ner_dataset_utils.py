@@ -7,10 +7,10 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-DEFAULT_DATASET_NAME = "anurag-raapid/chia"
+DEFAULT_DATASET_NAME = "anurag-raapid/lct-corpus"
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_PHASE1_MODEL_PATH = str(PROJECT_ROOT / "qwen3-phase1-checkpoint")
-DEFAULT_ARTIFACT_DIR = PROJECT_ROOT / "artifacts" / "ncbi_disease"
+DEFAULT_ARTIFACT_DIR = PROJECT_ROOT / "artifacts" / "lct-corpus"
 DEFAULT_DIST_PATH = str(DEFAULT_ARTIFACT_DIR / "entity_distributions.json")
 
 
