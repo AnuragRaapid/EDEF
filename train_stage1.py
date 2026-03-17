@@ -20,7 +20,11 @@ from transformers import (
 )
 
 from edef_data import EDEFDataCollator, build_edef_dataset
-from edef_model import attach_edef_to_model, save_edef_checkpoint
+from edef_model import (
+    attach_edef_to_model,
+    resolve_trainable_module,
+    save_edef_checkpoint,
+)
 from ner_dataset_utils import (
     DEFAULT_DATASET_NAME,
     DEFAULT_DIST_PATH,
@@ -30,6 +34,17 @@ from ner_dataset_utils import (
 
 
 class EDEFTrainer(Trainer):
+    def __init__(
+        self,
+        *args,
+        projector_lr: float,
+        gate_lr: float,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.projector_lr = projector_lr
+        self.gate_lr = gate_lr
+
     def compute_loss(
         self, model, inputs, return_outputs=False, num_items_in_batch=None
     ):
@@ -43,6 +58,72 @@ class EDEFTrainer(Trainer):
             num_items_in_batch=num_items_in_batch,
         )
 
+    def create_optimizer(self):
+        if self.optimizer is not None:
+            return self.optimizer
+
+        opt_model = self.model_wrapped if self.model_wrapped is not None else self.model
+        decay_parameters = self.get_decay_parameter_names(opt_model)
+        grouped_parameters: dict[tuple[str, float], dict[str, Any]] = {}
+
+        for name, param in opt_model.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            if "entity_projector" in name:
+                group_name = "entity_projector"
+                group_lr = self.projector_lr
+            elif "fusion_gate" in name:
+                group_name = "fusion_gate"
+                group_lr = self.gate_lr
+            else:
+                raise RuntimeError(
+                    f"Unexpected trainable parameter outside EDEF modules: {name}"
+                )
+
+            weight_decay = self.args.weight_decay if name in decay_parameters else 0.0
+            group_key = (group_name, weight_decay)
+            group = grouped_parameters.setdefault(
+                group_key,
+                {
+                    "params": [],
+                    "lr": group_lr,
+                    "weight_decay": weight_decay,
+                    "name": group_name,
+                    "param_count": 0,
+                },
+            )
+            group["params"].append(param)
+            group["param_count"] += param.numel()
+
+        optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(
+            self.args, opt_model
+        )
+        optimizer_kwargs.pop("params", None)
+        optimizer_kwargs.pop("model", None)
+        optimizer_kwargs.pop("optimizer_dict", None)
+
+        self.optimizer = optimizer_cls(
+            [
+                {
+                    "params": group["params"],
+                    "lr": group["lr"],
+                    "weight_decay": group["weight_decay"],
+                }
+                for group in grouped_parameters.values()
+            ],
+            **optimizer_kwargs,
+        )
+
+        print("Optimizer groups:")
+        for group in grouped_parameters.values():
+            print(
+                f"  {group['name']}: lr={group['lr']:.2e}, "
+                + f"weight_decay={group['weight_decay']:.2e}, "
+                + f"params={group['param_count']:,}"
+            )
+        return self.optimizer
+
 
 class GateLoggingCallback(TrainerCallback):
     def __init__(self, model, log_every_steps=100):
@@ -54,6 +135,8 @@ class GateLoggingCallback(TrainerCallback):
             return
 
         gate = getattr(self.model, "fusion_gate", None)
+        if gate is not None:
+            gate = resolve_trainable_module(gate)
         gate_net = getattr(gate, "gate_net", None)
         gate_bias = getattr(gate_net, "bias", None)
         if gate_bias is None:
@@ -116,16 +199,28 @@ def parse_args():
     parser.add_argument("--cache_dir", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default="saves/edef-stage1")
     parser.add_argument("--max_length", type=int, default=4096)
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--grad_accum", type=int, default=4)
     parser.add_argument("--epochs", type=float, default=5)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument(
+        "--projector_lr",
+        type=float,
+        default=None,
+        help="Optional LR override for entity_projector. Defaults to --lr.",
+    )
+    parser.add_argument(
+        "--gate_lr",
+        type=float,
+        default=None,
+        help="Optional LR override for fusion_gate. Defaults to 2x --lr.",
+    )
     parser.add_argument("--warmup_ratio", type=float, default=0.03)
     parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--logging_steps", type=int, default=10)
-    parser.add_argument("--save_steps", type=int, default=500)
-    parser.add_argument("--gate_log_steps", type=int, default=100)
+    parser.add_argument("--save_steps", type=int, default=50)
+    parser.add_argument("--gate_log_steps", type=int, default=50)
     return parser.parse_args()
 
 
@@ -162,6 +257,20 @@ def print_trainable_params(model):
     print(f"Trainable params: {trainable:,} ({pct:.2f}%)")
 
 
+def print_edef_param_dtypes(model: Any) -> None:
+    projector = resolve_trainable_module(model.entity_projector)
+    gate = resolve_trainable_module(model.fusion_gate)
+    projector_dtype = next(projector.parameters()).dtype
+    gate_dtype = next(gate.parameters()).dtype
+    print(f"EDEF parameter dtypes: projector={projector_dtype}, gate={gate_dtype}")
+
+
+def resolve_learning_rates(args: argparse.Namespace) -> tuple[float, float]:
+    projector_lr = args.lr if args.projector_lr is None else args.projector_lr
+    gate_lr = args.lr * 2.0 if args.gate_lr is None else args.gate_lr
+    return projector_lr, gate_lr
+
+
 def patch_transformers_tf32() -> None:
     if not hasattr(torch.backends, "fp32_precision"):
         return
@@ -187,6 +296,7 @@ def main():
     args = parse_args()
     torch.manual_seed(args.seed)
     patch_transformers_tf32()
+    projector_lr, gate_lr = resolve_learning_rates(args)
     task_metadata = load_task_metadata_from_dist_path(args.dist_path)
     dist_dim = int(task_metadata["dist_dim"])
     instruction = str(task_metadata["instruction"])
@@ -204,7 +314,12 @@ def main():
         param.requires_grad = False
 
     hidden_dim = getattr(model.config, "hidden_size", 2560)
-    model = attach_edef_to_model(model, dist_dim=dist_dim, hidden_dim=hidden_dim)
+    model = attach_edef_to_model(
+        model,
+        dist_dim=dist_dim,
+        hidden_dim=hidden_dim,
+        trainable_dtype=torch.float32,
+    )
 
     for param in model.entity_projector.parameters():
         param.requires_grad = True
@@ -217,6 +332,11 @@ def main():
             model.config.use_cache = False
 
     print_trainable_params(model)
+    print_edef_param_dtypes(model)
+    print(
+        f"EDEF learning rates: entity_projector={projector_lr:.2e}, "
+        + f"fusion_gate={gate_lr:.2e}"
+    )
     print(
         f"Loaded {len(task_metadata['entity_types'])} entity types: {task_metadata['entity_types']}"
     )
@@ -261,7 +381,7 @@ def main():
         fp16=not args.bf16,
         tf32=True,
         optim="adamw_torch_fused",
-        torch_compile=True,
+        torch_compile=False,
         logging_steps=args.logging_steps,
         save_strategy="steps",
         save_steps=args.save_steps,
@@ -278,6 +398,8 @@ def main():
     trainer = EDEFTrainer(
         model=model,
         args=training_args,
+        projector_lr=projector_lr,
+        gate_lr=gate_lr,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=data_collator,

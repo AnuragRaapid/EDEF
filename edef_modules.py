@@ -42,7 +42,9 @@ class EntityDistProjector(nn.Module):
         Returns:
             (batch, seq_len, 2560) — projected features in LLM embedding space
         """
-        return self.projector(dist_vectors)
+        compute_dtype = self.projector[0].weight.dtype
+        with torch.autocast(device_type=dist_vectors.device.type, enabled=False):
+            return self.projector(dist_vectors.to(dtype=compute_dtype))
 
 
 class GatedFusion(nn.Module):
@@ -76,9 +78,15 @@ class GatedFusion(nn.Module):
         Returns:
             (batch, seq_len, 2560) — fused embeddings
         """
-        combined = torch.cat([token_embeddings, projected_features], dim=-1)
-        gate = torch.sigmoid(self.gate_net(combined))
-        return token_embeddings + gate * projected_features
+        output_dtype = token_embeddings.dtype
+        compute_dtype = self.gate_net.weight.dtype
+        with torch.autocast(device_type=token_embeddings.device.type, enabled=False):
+            token_embeddings_fp = token_embeddings.to(dtype=compute_dtype)
+            projected_features_fp = projected_features.to(dtype=compute_dtype)
+            combined = torch.cat([token_embeddings_fp, projected_features_fp], dim=-1)
+            gate = torch.sigmoid(self.gate_net(combined))
+            fused = token_embeddings_fp + gate * projected_features_fp
+        return fused.to(dtype=output_dtype)
 
 
 if __name__ == "__main__":
@@ -92,9 +100,11 @@ if __name__ == "__main__":
 
     proj_params = sum(p.numel() for p in projector.parameters())
     gate_params = sum(p.numel() for p in gate.parameters())
-    print(f"Projector params: {proj_params:,} ({proj_params/1e6:.2f}M)")
-    print(f"Gate params:      {gate_params:,} ({gate_params/1e6:.2f}M)")
-    print(f"Total EDEF params: {(proj_params + gate_params):,} ({(proj_params + gate_params)/1e6:.2f}M)\n")
+    print(f"Projector params: {proj_params:,} ({proj_params / 1e6:.2f}M)")
+    print(f"Gate params:      {gate_params:,} ({gate_params / 1e6:.2f}M)")
+    print(
+        f"Total EDEF params: {(proj_params + gate_params):,} ({(proj_params + gate_params) / 1e6:.2f}M)\n"
+    )
 
     # Forward pass
     dist_vectors = torch.randn(batch, seq_len, dist_dim)
@@ -114,15 +124,23 @@ if __name__ == "__main__":
     with torch.no_grad():
         combined = torch.cat([token_embeds, projected], dim=-1)
         gate_vals = torch.sigmoid(gate.gate_net(combined))
-        print(f"\nInitial gate stats: mean={gate_vals.mean():.4f}, "
-              f"std={gate_vals.std():.4f}, min={gate_vals.min():.4f}, max={gate_vals.max():.4f}")
-        assert 0.05 < gate_vals.mean().item() < 0.25, f"Gate mean {gate_vals.mean():.4f} not near 0.12!"
+        print(
+            f"\nInitial gate stats: mean={gate_vals.mean():.4f}, "
+            f"std={gate_vals.std():.4f}, min={gate_vals.min():.4f}, max={gate_vals.max():.4f}"
+        )
+        assert 0.05 < gate_vals.mean().item() < 0.25, (
+            f"Gate mean {gate_vals.mean():.4f} not near 0.12!"
+        )
 
     # Verify gradient flow
     loss = fused.sum()
     loss.backward()
-    proj_has_grad = all(p.grad is not None and p.grad.abs().sum() > 0 for p in projector.parameters())
-    gate_has_grad = all(p.grad is not None and p.grad.abs().sum() > 0 for p in gate.parameters())
+    proj_has_grad = all(
+        p.grad is not None and p.grad.abs().sum() > 0 for p in projector.parameters()
+    )
+    gate_has_grad = all(
+        p.grad is not None and p.grad.abs().sum() > 0 for p in gate.parameters()
+    )
     print(f"\nProjector gradients flow: {proj_has_grad}")
     print(f"Gate gradients flow:      {gate_has_grad}")
     assert proj_has_grad, "No gradients in projector!"

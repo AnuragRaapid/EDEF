@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-DEFAULT_DATASET_NAME = "anurag-raapid/ncbi-disease"
+DEFAULT_DATASET_NAME = "anurag-raapid/chia"
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_PHASE1_MODEL_PATH = str(PROJECT_ROOT / "qwen3-phase1-checkpoint")
 DEFAULT_ARTIFACT_DIR = PROJECT_ROOT / "artifacts" / "ncbi_disease"
@@ -113,7 +113,8 @@ def entity_records_to_output_text(entities: Iterable[dict[str, Any]]) -> str:
         "ner": [
             [str(entity.get("text", "")).strip(), str(entity.get("type", "")).strip()]
             for entity in entities
-            if str(entity.get("text", "")).strip() and str(entity.get("type", "")).strip()
+            if str(entity.get("text", "")).strip()
+            and str(entity.get("type", "")).strip()
         ]
     }
     return json.dumps(payload, ensure_ascii=False)
@@ -279,7 +280,9 @@ def load_ner_samples(
             continue
 
         if "text" in sample and ("entity" in sample or "entities" in sample):
-            entities = parse_entity_records(sample.get("entity", sample.get("entities", [])))
+            entities = parse_entity_records(
+                sample.get("entity", sample.get("entities", []))
+            )
             tokens = sample.get("tokens")
             converted_sample: dict[str, Any] = {
                 "instruction": str(instruction or sample.get("instruction", "")),
