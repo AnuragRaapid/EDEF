@@ -233,9 +233,10 @@ class DecoderBackboneTokenClassifier(nn.Module):
 
     def encode(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         entity_dist_vectors: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
         decoder = _get_decoder_module(self.backbone)
@@ -245,12 +246,26 @@ class DecoderBackboneTokenClassifier(nn.Module):
         model_kwargs.setdefault("use_cache", False)
 
         if entity_dist_vectors is None or edef_modules is None:
-            outputs = decoder(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                **model_kwargs,
-            )
+            if inputs_embeds is not None:
+                outputs = decoder(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    **model_kwargs,
+                )
+            else:
+                if input_ids is None:
+                    raise ValueError("input_ids or inputs_embeds must be provided")
+                outputs = decoder(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    **model_kwargs,
+                )
             return outputs.last_hidden_state
+
+        if input_ids is None:
+            raise ValueError(
+                "input_ids must be provided when entity_dist_vectors are used so fused embeddings can be recomputed"
+            )
 
         embed_tokens = _get_embed_tokens_module(self.backbone)
         inputs_embeds = embed_tokens(input_ids)
@@ -276,16 +291,18 @@ class DecoderBackboneTokenClassifier(nn.Module):
         input_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         entity_dist_vectors: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
         labels: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> dict[str, torch.Tensor]:
-        if input_ids is None:
-            raise ValueError("input_ids must be provided")
+        if input_ids is None and inputs_embeds is None:
+            raise ValueError("input_ids or inputs_embeds must be provided")
 
         hidden_states = self.encode(
             input_ids=input_ids,
             attention_mask=attention_mask,
             entity_dist_vectors=entity_dist_vectors,
+            inputs_embeds=inputs_embeds,
             **kwargs,
         )
         logits = self.classifier(hidden_states)

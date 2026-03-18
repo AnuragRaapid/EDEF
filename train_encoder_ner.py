@@ -6,14 +6,28 @@ from __future__ import annotations
 
 import argparse
 import os
+from collections.abc import Sequence
 from typing import Any
 
 import torch
 from peft import LoraConfig, get_peft_model
-from transformers import AutoTokenizer, Trainer, TrainingArguments
+from transformers import (
+    AutoTokenizer,
+    EarlyStoppingCallback,
+    Trainer,
+    TrainingArguments,
+)
+from transformers.trainer_callback import ExportableState
+from transformers.trainer_utils import EvalLoopOutput
 
-from encoder_ner.bio_utils import build_label_mappings, save_label_metadata
-from encoder_ner.dataset import BioDataCollator, build_bio_dataset
+from encoder_ner.bio_utils import (
+    build_label_mappings,
+    decode_bio_labels,
+    normalize_entity_tuples,
+    save_label_metadata,
+)
+from encoder_ner.dataset import BioDataCollator, _to_offset_list, build_bio_dataset
+from encoder_ner.metrics import calculate_metrics, exact_match, relaxed_match
 from encoder_ner.modeling import (
     DecoderBackboneTokenClassifier,
     enable_gradient_checkpointing,
@@ -32,11 +46,21 @@ from ner_dataset_utils import (
 
 class EncoderNERTrainer(Trainer):
     def __init__(
-        self, *args: Any, lora_lr: float, head_lr: float, **kwargs: Any
+        self,
+        *args: Any,
+        lora_lr: float,
+        head_lr: float,
+        tokenizer: Any,
+        id_to_label: dict[int, str],
+        max_length: int,
+        **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.lora_lr = lora_lr
         self.head_lr = head_lr
+        self.tokenizer = tokenizer
+        self.id_to_label = id_to_label
+        self.max_length = max_length
 
     def create_optimizer(self):
         if self.optimizer is not None:
@@ -99,6 +123,157 @@ class EncoderNERTrainer(Trainer):
             )
         return self.optimizer
 
+    def _resolve_decoder(self, model: Any) -> Any:
+        candidates: list[Any] = [model]
+        get_base_model = getattr(model, "get_base_model", None)
+        if callable(get_base_model):
+            try:
+                candidates.append(get_base_model())
+            except Exception:
+                pass
+        candidates.extend(
+            [
+                getattr(model, "base_model", None),
+                getattr(getattr(model, "base_model", None), "model", None),
+                getattr(model, "model", None),
+            ]
+        )
+        for candidate in candidates:
+            if candidate is not None and callable(
+                getattr(candidate, "decode_predictions", None)
+            ):
+                return candidate
+        raise AttributeError("Could not resolve model.decode_predictions()")
+
+    def _build_entity_metric_inputs(
+        self, eval_dataset: Any, start_idx: int, stop_idx: int
+    ) -> tuple[list[dict[str, Any]], dict[str, torch.Tensor]]:
+        features = [eval_dataset[idx] for idx in range(start_idx, stop_idx)]
+        batch = self.data_collator(features)
+        prepared_batch = self._prepare_inputs(batch)
+        return features, prepared_batch
+
+    def _compute_entity_metrics(
+        self, eval_dataset: Any, metric_key_prefix: str
+    ) -> dict[str, float]:
+        samples = getattr(eval_dataset, "samples", None)
+        if not isinstance(samples, Sequence) or not samples:
+            return {}
+
+        model = self.model
+        decoder = self._resolve_decoder(model)
+        was_training = model.training
+        model.eval()
+
+        all_predictions: list[list[tuple[str, str]]] = []
+        all_golds: list[list[tuple[str, str]]] = []
+        batch_size = max(1, self.args.per_device_eval_batch_size)
+
+        try:
+            for start_idx in range(0, len(eval_dataset), batch_size):
+                stop_idx = min(start_idx + batch_size, len(eval_dataset))
+                _, prepared_batch = self._build_entity_metric_inputs(
+                    eval_dataset, start_idx, stop_idx
+                )
+
+                model_inputs = {
+                    key: value
+                    for key, value in prepared_batch.items()
+                    if key != "labels"
+                }
+                with torch.no_grad():
+                    outputs = model(**model_inputs)
+
+                decoded_paths = decoder.decode_predictions(
+                    outputs["logits"],
+                    prepared_batch["attention_mask"],
+                )
+
+                for batch_offset, pred_ids in enumerate(decoded_paths):
+                    sample = samples[start_idx + batch_offset]
+                    text = str(sample.get("text", sample.get("input", "")))
+                    encoding = self.tokenizer(
+                        text,
+                        truncation=True,
+                        max_length=self.max_length,
+                        return_tensors="pt",
+                        return_offsets_mapping=True,
+                        add_special_tokens=False,
+                    )
+                    offset_mapping = _to_offset_list(
+                        encoding["offset_mapping"].squeeze(0)
+                    )
+                    predicted_entities = decode_bio_labels(
+                        text, offset_mapping, pred_ids, self.id_to_label
+                    )
+                    normalized_preds = normalize_entity_tuples(predicted_entities)
+                    gold_entities = normalize_entity_tuples(sample.get("entities", []))
+                    all_predictions.append(normalized_preds)
+                    all_golds.append(gold_entities)
+        finally:
+            if was_training:
+                model.train()
+
+        exact_tp = exact_fp = exact_fn = 0
+        relaxed_tp = relaxed_fp = relaxed_fn = 0
+        for pred_entities, gold_entities in zip(all_predictions, all_golds):
+            tp, fp, fn = exact_match(pred_entities, gold_entities)
+            exact_tp += tp
+            exact_fp += fp
+            exact_fn += fn
+
+            tp, fp, fn = relaxed_match(pred_entities, gold_entities)
+            relaxed_tp += tp
+            relaxed_fp += fp
+            relaxed_fn += fn
+
+        exact_precision, exact_recall, exact_f1 = calculate_metrics(
+            exact_tp, exact_fp, exact_fn
+        )
+        relaxed_precision, relaxed_recall, relaxed_f1 = calculate_metrics(
+            relaxed_tp, relaxed_fp, relaxed_fn
+        )
+        return {
+            f"{metric_key_prefix}_entity_precision": exact_precision,
+            f"{metric_key_prefix}_entity_recall": exact_recall,
+            f"{metric_key_prefix}_entity_f1": exact_f1,
+            f"{metric_key_prefix}_relaxed_entity_precision": relaxed_precision,
+            f"{metric_key_prefix}_relaxed_entity_recall": relaxed_recall,
+            f"{metric_key_prefix}_relaxed_entity_f1": relaxed_f1,
+        }
+
+    def evaluation_loop(
+        self,
+        dataloader: Any,
+        description: str,
+        prediction_loss_only: bool | None = None,
+        ignore_keys: list[str] | None = None,
+        metric_key_prefix: str = "eval",
+    ) -> EvalLoopOutput:
+        output = super().evaluation_loop(
+            dataloader=dataloader,
+            description=description,
+            prediction_loss_only=prediction_loss_only,
+            ignore_keys=ignore_keys,
+            metric_key_prefix=metric_key_prefix,
+        )
+        eval_dataset = getattr(dataloader, "dataset", None)
+        output.metrics.update(
+            self._compute_entity_metrics(eval_dataset, metric_key_prefix)
+        )
+        return output
+
+    def _save_checkpoint(self, model: Any, trial: Any = None) -> None:
+        # Ensure stateful_callbacks has an entry for every ExportableState callback
+        # so that resuming from a checkpoint saved without EarlyStoppingCallback (or
+        # with a different set of callbacks) does not raise KeyError when saving.
+        for cb in self.callback_handler.callbacks + [self.control]:
+            if isinstance(cb, ExportableState):
+                cb_name = cb.__class__.__name__
+                if cb_name not in self.state.stateful_callbacks:
+                    self.state.stateful_callbacks[cb_name] = cb.state()
+        super()._save_checkpoint(model, trial)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -153,7 +328,7 @@ def parse_args() -> argparse.Namespace:
         help="Entity distribution file path used by the Stage 2 EDEF model.",
     )
     parser.add_argument("--train_split", type=str, default="train")
-    parser.add_argument("--val_split", type=str, default="validation")
+    parser.add_argument("--val_split", type=str, default="test")
     parser.add_argument("--dataset_revision", type=str, default=None)
     parser.add_argument("--cache_dir", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default="saves/encoder-ner")
@@ -173,8 +348,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--logging_steps", type=int, default=10)
+    parser.add_argument(
+        "--save_strategy",
+        type=str,
+        default="epoch",
+        choices=["steps", "epoch"],
+        help="Checkpoint save cadence. Keep this aligned with --eval_strategy.",
+    )
     parser.add_argument("--save_steps", type=int, default=100)
+    parser.add_argument(
+        "--eval_strategy",
+        type=str,
+        default="epoch",
+        choices=["steps", "epoch"],
+        help="Evaluation cadence. Use `epoch` so early stopping patience maps to epochs.",
+    )
     parser.add_argument("--eval_steps", type=int, default=100)
+    parser.add_argument(
+        "--early_stopping_patience",
+        type=int,
+        default=3,
+        help="Stop after this many evaluations without improving entity F1.",
+    )
+    parser.add_argument(
+        "--early_stopping_threshold",
+        type=float,
+        default=0.0,
+        help="Minimum entity F1 improvement required to reset early stopping patience.",
+    )
     parser.add_argument("--lora_r", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
@@ -201,7 +402,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Ignore entity distribution fusion and train on the text alone.",
     )
-    parser.add_argument("--resume_from_checkpoint", type=str, default=None)
+    parser.add_argument(
+        "--save_total_limit",
+        type=int,
+        default=5,
+        help="Keep at most this many checkpoints (best is always kept when load_best_model_at_end=True).",
+    )
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help="Path to a checkpoint dir (e.g. output_dir/checkpoint-200) containing trainer_state.json to resume.",
+    )
     return parser.parse_args()
 
 
@@ -255,7 +467,7 @@ def main() -> None:
     patch_transformers_tf32()
 
     entity_types, instruction, dist_dim = resolve_entity_types(args)
-    label_list, label_to_id, _ = build_label_mappings(entity_types)
+    label_list, label_to_id, id_to_label = build_label_mappings(entity_types)
 
     tokenizer_source = args.stage2_adapter or args.phase1_model or args.base_model
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, trust_remote_code=True)
@@ -351,6 +563,10 @@ def main() -> None:
             "stage2_adapter": args.stage2_adapter,
             "stage2_edef_checkpoint": args.stage2_edef_checkpoint,
             "max_length": args.max_length,
+            "eval_strategy": args.eval_strategy,
+            "save_strategy": args.save_strategy,
+            "early_stopping_patience": args.early_stopping_patience,
+            "metric_for_best_model": "eval_entity_f1",
         },
     )
 
@@ -370,16 +586,20 @@ def main() -> None:
         tf32=True,
         optim=optim_name,
         logging_steps=args.logging_steps,
-        save_strategy="steps",
+        save_strategy=args.save_strategy,
         save_steps=args.save_steps,
-        eval_strategy="steps",
+        eval_strategy=args.eval_strategy,
         eval_steps=args.eval_steps,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_entity_f1",
+        greater_is_better=True,
         remove_unused_columns=False,
         seed=args.seed,
         dataloader_pin_memory=True,
         dataloader_num_workers=4,
         dataloader_prefetch_factor=2,
         report_to="none",
+        save_total_limit=args.save_total_limit,
     )
 
     trainer = EncoderNERTrainer(
@@ -387,9 +607,18 @@ def main() -> None:
         args=training_args,
         lora_lr=args.lr,
         head_lr=args.head_lr,
+        tokenizer=tokenizer,
+        id_to_label=id_to_label,
+        max_length=args.max_length,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=data_collator,
+        callbacks=[
+            EarlyStoppingCallback(
+                early_stopping_patience=args.early_stopping_patience,
+                early_stopping_threshold=args.early_stopping_threshold,
+            )
+        ],
     )
 
     print("Starting encoder-style BIO training...")
@@ -397,6 +626,13 @@ def main() -> None:
     trainer.save_model(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
     print(f"Encoder NER adapter saved to {args.output_dir}")
+    if trainer.state.best_model_checkpoint:
+        print(
+            f"To resume from best checkpoint later, use: --resume_from_checkpoint {trainer.state.best_model_checkpoint}"
+        )
+    print(
+        "To resume from any saved checkpoint, use: --resume_from_checkpoint <output_dir>/checkpoint-<step>"
+    )
 
 
 if __name__ == "__main__":

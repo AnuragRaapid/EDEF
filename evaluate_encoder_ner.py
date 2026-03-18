@@ -119,6 +119,10 @@ def parse_args() -> argparse.Namespace:
 
 def resolve_runtime_config(args: argparse.Namespace) -> dict[str, Any]:
     metadata_path = os.path.join(args.model_path, LABEL_METADATA_FILENAME)
+    if not os.path.isfile(metadata_path):
+        parent = os.path.dirname(args.model_path)
+        if parent and os.path.isfile(os.path.join(parent, LABEL_METADATA_FILENAME)):
+            metadata_path = os.path.join(parent, LABEL_METADATA_FILENAME)
     metadata = load_label_metadata(metadata_path)
 
     runtime = {

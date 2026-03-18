@@ -13,8 +13,8 @@ Why this exists:
 ```bash
 uv run python3 train_encoder_ner.py \
   --phase1_model qwen3-phase1-checkpoint \
-  --stage2_adapter /path/to/your/stage2-output \
-  --stage2_edef_checkpoint /path/to/your/stage2-output/edef_checkpoint \
+  --stage2_adapter /workspace/EDEF/lct-checkpoint \
+  --stage2_edef_checkpoint /workspace/EDEF/lct-checkpoint/edef_checkpoint \
   --head_type bilstm_crf \
   --train_data anurag-raapid/lct-corpus \
   --val_data anurag-raapid/lct-corpus \
